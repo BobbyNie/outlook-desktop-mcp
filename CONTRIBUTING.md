@@ -64,23 +64,25 @@ pytest                         # runs tests/unit by default
 outlook-desktop-mcp.cmd test-unit
 ```
 
-CI runs on every push and pull request:
+CI runs on every push and pull request. **All required checks must pass before
+opening or updating a pull request** (unit tests + security). Do not mark a PR
+ready for review until GitHub Actions is green.
 
 - **Unit tests** (`.github/workflows/test.yml`) — ubuntu/macOS/windows with Python
   3.10–3.13; gates PyPI publish.
 - **Security** (`.github/workflows/security.yml`) — `pip-audit` on installed
   dependencies and `bandit` on `src/outlook_desktop_mcp` (medium severity and
   above); also gates publish.
-- **Integration** (optional, same test workflow) — Windows job with
-  `RUN_OUTLOOK_INTEGRATION=1`; `continue-on-error` because GitHub-hosted runners
-  usually lack Outlook.
+- **Integration** (`.github/workflows/integration.yml`, manual only) — run via
+  **Actions → Integration (Outlook) → Run workflow** on a machine with Classic
+  Outlook. Not a PR gate because hosted runners do not have Outlook.
 
-Run locally:
+Run locally before pushing:
 
 ```bash
 pip install -e ".[dev]"
 pytest
-python -m pip_audit
+python -m pip_audit --ignore-vuln PYSEC-2025-183
 python -m bandit -r src/outlook_desktop_mcp -ll -c pyproject.toml
 ```
 
