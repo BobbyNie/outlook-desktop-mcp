@@ -38,8 +38,8 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (33 tools)    │    │  Bridge          │
-              │                │    │  (25 tools)      │
+              │  (39 tools)    │    │  Bridge          │
+              │                │    │  (32 tools)      │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -332,8 +332,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (33 tools, COM automation)
-    server_mac.py            # macOS MCP server (25 tools, AppleScript)
+    server.py                # Windows MCP server (39 tools, COM automation)
+    server_mac.py            # macOS MCP server (32 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/
