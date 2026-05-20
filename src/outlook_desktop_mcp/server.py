@@ -51,13 +51,18 @@ from outlook_desktop_mcp.utils.attachment_safety import (
     UnsafeAttachmentPath,
     ensure_save_directory,
     resolve_attachment_path,
+    validate_readable_attachment,
 )
 from outlook_desktop_mcp.utils.draft_html import (
     InvalidInlineImage,
     prepare_inline_html,
     suggest_attachment_basename,
 )
-from outlook_desktop_mcp.utils.errors import format_com_error
+from outlook_desktop_mcp.utils.errors import (
+    format_bridge_exception,
+    format_com_error,
+    tool_error_json,
+)
 from outlook_desktop_mcp.utils.dasl import dasl_date_literal
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
@@ -325,7 +330,7 @@ async def list_accounts() -> str:
     try:
         return await bridge.call(_list)
     except Exception as e:
-        return f"Error listing accounts: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing accounts")
 
 
 # =====================================================================
@@ -389,7 +394,7 @@ async def send_email(
     try:
         return await bridge.call(_send, to, subject, body, cc, bcc, html_body, account)
     except Exception as e:
-        return f"Error sending email: {format_com_error(e)}"
+        return format_bridge_exception(e, action="sending email")
 
 
 # =====================================================================
@@ -467,7 +472,7 @@ async def list_emails(
     try:
         return await bridge.call(_list, folder, count, unread_only, start_date, end_date, account)
     except Exception as e:
-        return f"Error listing emails: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing emails")
 
 
 # =====================================================================
@@ -529,7 +534,7 @@ async def read_email(
     try:
         return await bridge.call(_read, entry_id, subject_search, folder, account)
     except Exception as e:
-        return f"Error reading email: {format_com_error(e)}"
+        return format_bridge_exception(e, action="reading email")
 
 
 # =====================================================================
@@ -564,7 +569,7 @@ async def mark_as_read(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_mark, entry_id, account)
     except Exception as e:
-        return f"Error marking email as read: {format_com_error(e)}"
+        return format_bridge_exception(e, action="marking email as read")
 
 
 # =====================================================================
@@ -599,7 +604,7 @@ async def mark_as_unread(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_mark, entry_id, account)
     except Exception as e:
-        return f"Error marking email as unread: {format_com_error(e)}"
+        return format_bridge_exception(e, action="marking email as unread")
 
 
 # =====================================================================
@@ -652,7 +657,7 @@ async def move_email(
     try:
         return await bridge.call(_move, entry_id, target_folder, account)
     except Exception as e:
-        return f"Error moving email: {format_com_error(e)}"
+        return format_bridge_exception(e, action="moving email")
 
 
 # =====================================================================
@@ -715,7 +720,7 @@ async def reply_email(
     try:
         return await bridge.call(_reply, entry_id, body, reply_all, account)
     except Exception as e:
-        return f"Error replying to email: {format_com_error(e)}"
+        return format_bridge_exception(e, action="replying to email")
 
 
 # =====================================================================
@@ -794,7 +799,7 @@ async def list_folders(folder: str = "", max_depth: int = 3, account: str = "") 
     try:
         return await bridge.call(_list, folder, max_depth, account)
     except Exception as e:
-        return f"Error listing folders: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing folders")
 
 
 # =====================================================================
@@ -875,7 +880,7 @@ async def search_emails(
     try:
         return await bridge.call(_search, query, folder, count, start_date, end_date, account)
     except Exception as e:
-        return f"Error searching emails: {format_com_error(e)}"
+        return format_bridge_exception(e, action="searching emails")
 
 
 # =====================================================================
@@ -957,7 +962,7 @@ async def list_events(
     try:
         return await bridge.call(_list, start_date, end_date, count, account)
     except Exception as e:
-        return f"Error listing events: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing events")
 
 
 # =====================================================================
@@ -989,7 +994,7 @@ async def get_event(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_get, entry_id, account)
     except Exception as e:
-        return f"Error reading event: {format_com_error(e)}"
+        return format_bridge_exception(e, action="reading event")
 
 
 # =====================================================================
@@ -1069,7 +1074,7 @@ async def create_event(
             reminder_minutes, account,
         )
     except Exception as e:
-        return f"Error creating event: {format_com_error(e)}"
+        return format_bridge_exception(e, action="creating event")
 
 
 # =====================================================================
@@ -1181,7 +1186,7 @@ async def create_meeting(
             optional_attendees, account,
         )
     except Exception as e:
-        return f"Error creating meeting: {format_com_error(e)}"
+        return format_bridge_exception(e, action="creating meeting")
 
 
 # =====================================================================
@@ -1246,7 +1251,7 @@ async def update_event(
             _update, entry_id, subject, start, end, location, body, account,
         )
     except Exception as e:
-        return f"Error updating event: {format_com_error(e)}"
+        return format_bridge_exception(e, action="updating event")
 
 
 # =====================================================================
@@ -1304,7 +1309,7 @@ async def delete_event(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_delete, entry_id, account)
     except Exception as e:
-        return f"Error deleting event: {format_com_error(e)}"
+        return format_bridge_exception(e, action="deleting event")
 
 
 # =====================================================================
@@ -1371,7 +1376,7 @@ async def respond_to_meeting(
     try:
         return await bridge.call(_respond, entry_id, response, account)
     except Exception as e:
-        return f"Error responding to meeting: {format_com_error(e)}"
+        return format_bridge_exception(e, action="responding to meeting")
 
 
 # =====================================================================
@@ -1437,7 +1442,7 @@ async def search_events(
     try:
         return await bridge.call(_search, query, start_date, end_date, count, account)
     except Exception as e:
-        return f"Error searching events: {format_com_error(e)}"
+        return format_bridge_exception(e, action="searching events")
 
 
 # =====================================================================
@@ -1487,7 +1492,7 @@ async def list_tasks(
     try:
         return await bridge.call(_list, include_completed, count, account)
     except Exception as e:
-        return f"Error listing tasks: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing tasks")
 
 
 @mcp.tool()
@@ -1511,7 +1516,7 @@ async def get_task(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_get, entry_id, account)
     except Exception as e:
-        return f"Error reading task: {format_com_error(e)}"
+        return format_bridge_exception(e, action="reading task")
 
 
 @mcp.tool()
@@ -1573,7 +1578,7 @@ async def create_task(
             account,
         )
     except Exception as e:
-        return f"Error creating task: {format_com_error(e)}"
+        return format_bridge_exception(e, action="creating task")
 
 
 @mcp.tool()
@@ -1602,7 +1607,7 @@ async def complete_task(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_complete, entry_id, account)
     except Exception as e:
-        return f"Error completing task: {format_com_error(e)}"
+        return format_bridge_exception(e, action="completing task")
 
 
 @mcp.tool()
@@ -1628,7 +1633,7 @@ async def delete_task(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_delete, entry_id, account)
     except Exception as e:
-        return f"Error deleting task: {format_com_error(e)}"
+        return format_bridge_exception(e, action="deleting task")
 
 
 # =====================================================================
@@ -1662,7 +1667,7 @@ async def list_attachments(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_list, entry_id, account)
     except Exception as e:
-        return f"Error listing attachments: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing attachments")
 
 
 @mcp.tool()
@@ -1717,7 +1722,7 @@ async def save_attachment(
     try:
         return await bridge.call(_save, entry_id, attachment_index, save_dir, account)
     except Exception as e:
-        return f"Error saving attachment: {format_com_error(e)}"
+        return format_bridge_exception(e, action="saving attachment")
 
 
 # =====================================================================
@@ -1749,7 +1754,7 @@ async def list_categories(account: str = "") -> str:
     try:
         return await bridge.call(_list, account)
     except Exception as e:
-        return f"Error listing categories: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing categories")
 
 
 @mcp.tool()
@@ -1786,7 +1791,7 @@ async def set_category(
     try:
         return await bridge.call(_set, entry_id, categories, account)
     except Exception as e:
-        return f"Error setting categories: {format_com_error(e)}"
+        return format_bridge_exception(e, action="setting categories")
 
 
 # =====================================================================
@@ -1822,7 +1827,7 @@ async def list_rules(account: str = "") -> str:
     try:
         return await bridge.call(_list, account)
     except Exception as e:
-        return f"Error listing rules: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing rules")
 
 
 @mcp.tool()
@@ -1864,7 +1869,7 @@ async def toggle_rule(
     try:
         return await bridge.call(_toggle, rule_name, enabled, account)
     except Exception as e:
-        return f"Error toggling rule: {format_com_error(e)}"
+        return format_bridge_exception(e, action="toggling rule")
 
 
 # =====================================================================
@@ -1930,7 +1935,7 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:
-        return f"Error listing contacts: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing contacts")
 
 
 @mcp.tool()
@@ -1987,7 +1992,7 @@ async def search_contacts(
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:
-        return f"Error searching contacts: {format_com_error(e)}"
+        return format_bridge_exception(e, action="searching contacts")
 
 
 @mcp.tool()
@@ -2042,7 +2047,7 @@ async def resolve_recipient(name: str, account: str = "") -> str:
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:
-        return f"Error resolving recipient: {format_com_error(e)}"
+        return format_bridge_exception(e, action="resolving recipient")
 
 
 # =====================================================================
@@ -2117,19 +2122,30 @@ def _apply_draft_body(
 
 
 def _add_regular_attachments(mail, attachments) -> list[str]:
-    """Add file paths as ordinary attachments. Returns the list of basenames added."""
+    """Add file paths as ordinary attachments.
+
+    Each path is validated by :func:`validate_readable_attachment` to ensure
+    the server never reads files outside the user's home or temp directory
+    (defends against an LLM being tricked into exfiltrating credentials,
+    SSH keys, etc. via ``send_draft``/``send_email``).
+
+    Returns the list of basenames added.
+    """
     added: list[str] = []
     if not attachments:
         return added
-    for entry in attachments:
+    for index, entry in enumerate(attachments):
         if not isinstance(entry, str) or not entry:
             raise ValueError("attachments must be a list of file path strings")
-        if entry.startswith("\\\\") or entry.startswith("//"):
-            raise ValueError(f"UNC paths not allowed for attachment: {entry!r}")
-        abs_path = os.path.abspath(os.path.expanduser(entry))
-        if not os.path.isfile(abs_path):
-            raise ValueError(f"attachment file does not exist: {entry!r}")
-        mail.Attachments.Add(abs_path, _OL_ATTACH_BY_VALUE, 1, suggest_attachment_basename(abs_path))
+        try:
+            abs_path = validate_readable_attachment(
+                entry, label=f"attachments[{index}]"
+            )
+        except UnsafeAttachmentPath as e:
+            raise ValueError(str(e)) from e
+        mail.Attachments.Add(
+            abs_path, _OL_ATTACH_BY_VALUE, 1, suggest_attachment_basename(abs_path)
+        )
         added.append(os.path.basename(abs_path))
     return added
 
@@ -2193,7 +2209,7 @@ async def list_drafts(count: int = 20, account: str = "") -> str:
     try:
         return await bridge.call(_list, count, account)
     except Exception as e:
-        return f"Error listing drafts: {format_com_error(e)}"
+        return format_bridge_exception(e, action="listing drafts")
 
 
 @mcp.tool()
@@ -2249,7 +2265,7 @@ async def get_draft(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_get, entry_id, account)
     except Exception as e:
-        return f"Error reading draft: {format_com_error(e)}"
+        return format_bridge_exception(e, action="reading draft")
 
 
 @mcp.tool()
@@ -2351,7 +2367,7 @@ async def create_draft(
             inline_images, attachments, account,
         )
     except Exception as e:
-        return f"Error creating draft: {format_com_error(e)}"
+        return format_bridge_exception(e, action="creating draft")
 
 
 @mcp.tool()
@@ -2432,7 +2448,7 @@ async def update_draft(
             inline_images, attachments, replace_attachments, account,
         )
     except Exception as e:
-        return f"Error updating draft: {format_com_error(e)}"
+        return format_bridge_exception(e, action="updating draft")
 
 
 def _require_draft(namespace, entry_id: str, account: str):
@@ -2490,7 +2506,7 @@ async def send_draft(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_send, entry_id, account)
     except Exception as e:
-        return f"Error sending draft: {format_com_error(e)}"
+        return format_bridge_exception(e, action="sending draft")
 
 
 @mcp.tool()
@@ -2516,7 +2532,7 @@ async def delete_draft(entry_id: str, account: str = "") -> str:
     try:
         return await bridge.call(_delete, entry_id, account)
     except Exception as e:
-        return f"Error deleting draft: {format_com_error(e)}"
+        return format_bridge_exception(e, action="deleting draft")
 
 
 # =====================================================================
@@ -2555,7 +2571,7 @@ async def get_out_of_office(account: str = "") -> str:
     try:
         return await bridge.call(_get, account)
     except Exception as e:
-        return f"Error checking OOF status: {format_com_error(e)}"
+        return format_bridge_exception(e, action="checking OOF status")
 
 
 # =====================================================================
