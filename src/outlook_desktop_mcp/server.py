@@ -64,6 +64,11 @@ from outlook_desktop_mcp.utils.errors import (
     tool_error_json,
 )
 from outlook_desktop_mcp.utils.dasl import dasl_date_literal
+from outlook_desktop_mcp.utils.com_compat import (
+    coerce_outlook_datetime,
+    compute_task_reminder_time,
+    save_then_move,
+)
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
@@ -1073,16 +1078,14 @@ async def create_event(
     """
     def _create(outlook, namespace, subject, start, end, location, body,
                 all_day, reminder_minutes, account):
+        start_dt = coerce_outlook_datetime(start)
+        end_dt = coerce_outlook_datetime(end)
         appt = outlook.CreateItem(OL_APPOINTMENT_ITEM)
-        if account:
-            store = _require_store(namespace, account)
-            cal = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
-            moved = appt.Move(cal)
-            if moved is not None:
-                appt = moved
         appt.Subject = subject
-        appt.Start = start
-        appt.End = end
+        if start_dt is not None:
+            appt.Start = start_dt
+        if end_dt is not None:
+            appt.End = end_dt
         if location:
             appt.Location = location
         if body:
@@ -1093,6 +1096,11 @@ async def create_event(
             appt.ReminderMinutesBeforeStart = reminder_minutes
         else:
             appt.ReminderSet = False
+        target_folder = None
+        if account:
+            store = _require_store(namespace, account)
+            target_folder = store.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        appt = save_then_move(appt, target_folder)
         appt.Save()
         return json.dumps({
             "status": "created",
@@ -1161,9 +1169,13 @@ async def create_meeting(
                     "(no DeliveryStore match). Refusing to send from default identity."
                 )
             appt._oleobj_.Invoke(*(_PR_SEND_USING_ACCOUNT, 0, 8, 0, sender_account))
+        start_dt = coerce_outlook_datetime(start)
+        end_dt = coerce_outlook_datetime(end)
         appt.Subject = subject
-        appt.Start = start
-        appt.End = end
+        if start_dt is not None:
+            appt.Start = start_dt
+        if end_dt is not None:
+            appt.End = end_dt
         appt.MeetingStatus = OL_MEETING
         if location:
             appt.Location = location
@@ -1260,12 +1272,14 @@ async def update_event(
         item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_APPOINTMENT, "appointment/meeting item"):
             return err
+        start_dt = coerce_outlook_datetime(start) if start else None
+        end_dt = coerce_outlook_datetime(end) if end else None
         if subject:
             item.Subject = subject
-        if start:
-            item.Start = start
-        if end:
-            item.End = end
+        if start_dt is not None:
+            item.Start = start_dt
+        if end_dt is not None:
+            item.End = end_dt
         if location:
             item.Location = location
         if body:
@@ -1324,7 +1338,7 @@ async def delete_event(entry_id: str, account: str = "") -> str:
 
         if meeting_status == _OL_MEETING_RECEIVED:
             try:
-                response_item = item.Respond(OL_RESPONSE_DECLINED)
+                response_item = item.Respond(OL_RESPONSE_DECLINED, True, True)
                 response_item.Send()
                 item.Delete()
                 return (
@@ -1392,13 +1406,15 @@ async def respond_to_meeting(
             except Exception as e:
                 return f"Error: meeting request has no associated appointment: {e}"
             subject = appointment.Subject
-            response_item = appointment.Respond(response_map[response_lower])
+            # fNoUI=True, fAdditionalTextDialog=True: no dialog, return response
+            # item that we then Send() ourselves (AppointmentItem.Respond docs).
+            response_item = appointment.Respond(response_map[response_lower], True, True)
             response_item.Send()
             return f"Responded '{response_lower}' to meeting request: '{subject}'"
 
         if item_class == _OL_CLASS_APPOINTMENT:
             subject = item.Subject
-            response_item = item.Respond(response_map[response_lower])
+            response_item = item.Respond(response_map[response_lower], True, True)
             response_item.Send()
             return f"Responded '{response_lower}' to meeting: '{subject}'"
 
@@ -1579,25 +1595,28 @@ async def create_task(
     """
     def _create(outlook, namespace, subject, body, due_date, importance,
                 reminder_minutes, account):
+        due_dt = coerce_outlook_datetime(due_date) if due_date else None
         task = outlook.CreateItem(OL_TASK_ITEM)
-        if account:
-            store = _require_store(namespace, account)
-            tasks_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
-            moved = task.Move(tasks_folder)
-            if moved is not None:
-                task = moved
         task.Subject = subject
         if body:
             task.Body = body
-        if due_date:
-            task.DueDate = due_date
+        if due_dt is not None:
+            task.DueDate = due_dt
         imp_map = {"low": 0, "normal": 1, "high": 2}
         task.Importance = imp_map.get(importance.lower(), 1)
-        if reminder_minutes > 0:
+        # TaskItem has ReminderTime (absolute datetime), NOT
+        # ReminderMinutesBeforeStart (that's on AppointmentItem only).
+        reminder_dt = compute_task_reminder_time(due_dt, reminder_minutes)
+        if reminder_dt is not None:
             task.ReminderSet = True
-            task.ReminderMinutesBeforeStart = reminder_minutes
+            task.ReminderTime = reminder_dt
         else:
             task.ReminderSet = False
+        target_folder = None
+        if account:
+            store = _require_store(namespace, account)
+            target_folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
+        task = save_then_move(task, target_folder)
         task.Save()
         return json.dumps({
             "status": "created",
@@ -1847,7 +1866,21 @@ async def list_rules(account: str = "") -> str:
     """
     def _list(outlook, namespace, account):
         store = _require_store(namespace, account)
-        rules = store.GetRules()
+        try:
+            rules = store.GetRules()
+        except Exception as exc:
+            return tool_error_json(
+                f"This store does not expose Rules ({format_com_error(exc)}). "
+                "Inbox rules require an Exchange / Microsoft 365 mailbox; "
+                "local PST stores have no Rules collection.",
+                code="rules_unavailable",
+            )
+        if rules is None:
+            return tool_error_json(
+                "This store has no Rules collection (typically a non-Exchange "
+                "store such as a local PST).",
+                code="rules_unavailable",
+            )
         results = []
         for i in range(rules.Count):
             rule = rules.Item(i + 1)
@@ -1887,7 +1920,18 @@ async def toggle_rule(
     """
     def _toggle(outlook, namespace, rule_name, enabled, account):
         store = _require_store(namespace, account)
-        rules = store.GetRules()
+        try:
+            rules = store.GetRules()
+        except Exception as exc:
+            return tool_error_json(
+                f"This store does not expose Rules ({format_com_error(exc)}).",
+                code="rules_unavailable",
+            )
+        if rules is None:
+            return tool_error_json(
+                "This store has no Rules collection (typically a non-Exchange store).",
+                code="rules_unavailable",
+            )
         for i in range(rules.Count):
             rule = rules.Item(i + 1)
             if rule.Name == rule_name:
