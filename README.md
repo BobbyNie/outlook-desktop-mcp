@@ -194,6 +194,11 @@ Run on the **same Windows user session** that will host Claude Code / the MCP se
    pytest tests/contacts_mcp_test.py tests/drafts_mcp_test.py -q
    ```
 
+   **GitHub Actions:** Hosted runners cannot run these tests (no Office). Use a
+   [self-hosted Windows runner with Office 2019](docs/office2019-self-hosted-runner.md)
+   and workflow **Integration (Office 2019 / self-hosted)**. Monitor runs with
+   `scripts/watch-integration-office2019.sh` or `gh run watch`.
+
 ### What this project does *not* solve offline
 
 - **No Graph / OAuth** — cannot reach cloud APIs when the network is down; only local Outlook state.
