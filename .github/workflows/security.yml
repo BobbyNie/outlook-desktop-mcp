@@ -20,7 +20,9 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Audit installed dependencies
-        run: python -m pip_audit --desc on
+        # pyjwt (transitive via mcp): PYSEC-2025-183 is disputed by the supplier;
+        # no fixed release. Track upstream mcp/pyjwt updates instead of blocking CI.
+        run: python -m pip_audit --desc on --ignore-vuln PYSEC-2025-183
 
   bandit:
     name: Static analysis (bandit)
