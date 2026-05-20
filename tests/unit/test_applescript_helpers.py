@@ -10,6 +10,7 @@ from outlook_desktop_mcp.utils.applescript_helpers import (
     escape,
     format_date,
     resolve_folder_ref,
+    split_delimited_record,
     validate_mac_entry_id,
 )
 
@@ -73,3 +74,17 @@ def test_resolve_folder_ref_custom_is_escaped():
     out = resolve_folder_ref('Quarterly "Reports"')
     assert out.startswith('mail folder "')
     assert '\\"Reports\\"' in out
+
+
+def test_validate_mac_entry_id_nfkc_normalizes_fullwidth_digits():
+    assert validate_mac_entry_id("４２") == "42"
+
+
+def test_split_delimited_record_tail_field_may_contain_delim():
+    record = f"a{DELIM}b{DELIM}c{DELIM}tail{DELIM}still-tail"
+    parts = split_delimited_record(record, DELIM, 4)
+    assert parts == ["a", "b", "c", f"tail{DELIM}still-tail"]
+
+
+def test_split_delimited_record_wrong_count_returns_none():
+    assert split_delimited_record(f"a{DELIM}b", DELIM, 3) is None

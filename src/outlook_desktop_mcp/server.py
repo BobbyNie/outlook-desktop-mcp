@@ -67,7 +67,10 @@ from outlook_desktop_mcp.utils.dasl import dasl_date_literal
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
+    contact_matches_query,
+    normalize_account_key,
     normalize_search_query,
+    pick_best_contact_match,
     should_cache_contact_result,
 )
 
@@ -221,12 +224,35 @@ def _resolve_account_object(outlook, store):
     return None
 
 
+def _store_from_store_id(namespace, store_id: str):
+    """Return the Store object matching ``store_id``, else DefaultStore."""
+    for i in range(1, namespace.Stores.Count + 1):
+        store = namespace.Stores.Item(i)
+        if store.StoreID == store_id:
+            return store
+    return namespace.DefaultStore
+
+
 def _get_item_for_account(namespace, entry_id: str, account: str = ""):
-    """Resolve a COM item by entry_id, honoring ``account`` end-to-end."""
+    """Resolve a COM item by entry_id, always scoping to a StoreID.
+
+    EntryIDs are only unique within a store. When multiple mailboxes are
+    loaded, ``GetItemFromID`` without a store can resolve the wrong item.
+    """
     if account:
         store = _require_store(namespace, account)
-        return namespace.GetItemFromID(entry_id, store.StoreID)
-    return namespace.GetItemFromID(entry_id)
+    else:
+        if namespace.Stores.Count > 1:
+            names = [
+                namespace.Stores.Item(i + 1).DisplayName
+                for i in range(namespace.Stores.Count)
+            ]
+            raise ValueError(
+                "account is required when multiple stores are loaded "
+                f"({', '.join(names)}). Use list_accounts."
+            )
+        store = namespace.DefaultStore
+    return namespace.GetItemFromID(entry_id, store.StoreID)
 
 
 # --- Helper: resolve folder by name ---
@@ -635,13 +661,19 @@ async def move_email(
         Confirmation with email subject and destination, or an error.
     """
     def _move(outlook, namespace, entry_id, target_folder, account):
-        store = _require_store(namespace, account)
         item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
-
-        dest = _resolve_folder(namespace, target_folder, store)
+        item_store = _store_from_store_id(namespace, item.Parent.StoreID)
+        if account:
+            requested = _require_store(namespace, account)
+            if requested.StoreID != item_store.StoreID:
+                raise ValueError(
+                    f"Account '{account}' does not match the mailbox containing "
+                    f"this message ({item_store.DisplayName})."
+                )
+        dest = _resolve_folder(namespace, target_folder, item_store)
         if not dest:
             return f"Error: Target folder '{target_folder}' not found. Use list_folders to see available folders."
 
@@ -838,6 +870,8 @@ async def search_emails(
         JSON array of matching email summaries, or an error.
     """
     def _search(outlook, namespace, query, folder, count, start_date, end_date, account):
+        if not query.strip():
+            return json.dumps({"error": "query must not be empty"})
         count = min(max(1, count), 200)
         store = _require_store(namespace, account)
         target = _resolve_folder(namespace, folder, store)
@@ -1898,6 +1932,48 @@ def _iter_contact_items(items, limit: int):
             continue
 
 
+def _contact_dasl_filter(query: str) -> str:
+    safe = _safe_dasl(query.replace("\xa0", " "))
+    parts = [
+        f'("urn:schemas:contacts:cn" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email1" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email2" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email3" LIKE \'%{safe}%\')',
+    ]
+    return "@SQL=" + " OR ".join(parts)
+
+
+def _search_contacts_in_python(folder, query: str, count: int) -> list[dict]:
+    scan_limit = min(max(count * 50, count), 2000)
+    items = folder.Items
+    try:
+        items.Sort("[FullName]", False)
+    except Exception:
+        pass
+    results: list[dict] = []
+    for item in _iter_contact_items(items, scan_limit):
+        summary = format_contact_summary(item)
+        if contact_matches_query(summary, query):
+            results.append(summary)
+            if len(results) >= count:
+                break
+    return results
+
+
+def _resolve_via_contacts_folder(folder, name: str) -> dict | None:
+    matches = _search_contacts_in_python(folder, name, count=20)
+    contact = pick_best_contact_match(matches, name)
+    if not contact or not contact.get("email"):
+        return None
+    return {
+        "resolved": True,
+        "name": contact.get("full_name") or name,
+        "email": contact["email"],
+        "address_type": "SMTP",
+        "source": "contacts_folder",
+    }
+
+
 @mcp.tool()
 async def list_contacts(count: int = 50, account: str = "") -> str:
     """List contacts from the Outlook Contacts folder (not the full GAL).
@@ -1914,26 +1990,31 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
         JSON array of contact summaries.
     """
     count = clamp_contact_count(count)
-    cache_key = contact_cache.make_key("list_contacts", count=count, account=account)
-    cached = contact_cache.get(cache_key)
-    if cached is not None:
-        return cached
 
     def _list(outlook, namespace, count, account):
         store = _require_store(namespace, account)
+        cache_key = contact_cache.make_key(
+            "list_contacts",
+            store_id=store.StoreID,
+            count=count,
+            account=normalize_account_key(account),
+        )
+        cached = contact_cache.get(cache_key)
+        if cached is not None:
+            return cached
         folder = _get_contacts_folder(store)
         items = folder.Items
         items.Sort("[FullName]", False)
         results = []
         for item in _iter_contact_items(items, count):
             results.append(format_contact_summary(item))
-        return json.dumps(results, indent=2, default=str)
-
-    try:
-        result = await bridge.call(_list, count, account)
+        result = json.dumps(results, indent=2, default=str)
         if should_cache_contact_result(result, tool="list_contacts"):
             contact_cache.set(cache_key, result)
         return result
+
+    try:
+        return await bridge.call(_list, count, account)
     except Exception as e:
         return format_bridge_exception(e, action="listing contacts")
 
@@ -1962,35 +2043,42 @@ async def search_contacts(
     if normalized is None:
         return "Error: query must not be empty"
     count = clamp_contact_count(count)
-    cache_key = contact_cache.make_key(
-        "search_contacts", query=normalized, count=count, account=account
-    )
-    cached = contact_cache.get(cache_key)
-    if cached is not None:
-        return cached
 
     def _search(outlook, namespace, query, count, account):
         store = _require_store(namespace, account)
-        folder = _get_contacts_folder(store)
-        safe = _safe_dasl(query)
-        filter_str = (
-            f"([FullName] LIKE '%{safe}%') OR "
-            f"([Email1Address] LIKE '%{safe}%') OR "
-            f"([Email2Address] LIKE '%{safe}%') OR "
-            f"([Email3Address] LIKE '%{safe}%')"
+        cache_key = contact_cache.make_key(
+            "search_contacts",
+            store_id=store.StoreID,
+            query=query,
+            count=count,
+            account=normalize_account_key(account),
         )
-        items = folder.Items.Restrict(filter_str)
-        items.Sort("[FullName]", False)
-        results = []
-        for item in _iter_contact_items(items, count):
-            results.append(format_contact_summary(item))
-        return json.dumps(results, indent=2, default=str)
-
-    try:
-        result = await bridge.call(_search, normalized, count, account)
+        cached = contact_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        folder = _get_contacts_folder(store)
+        results: list[dict] = []
+        try:
+            items = folder.Items.Restrict(_contact_dasl_filter(query))
+            try:
+                items.Sort("[FullName]", False)
+            except Exception:
+                pass
+            for item in _iter_contact_items(items, count):
+                results.append(format_contact_summary(item))
+        except Exception as exc:
+            logger.warning(
+                "Contacts Restrict failed (%s); falling back to Python scan",
+                exc,
+            )
+            results = _search_contacts_in_python(folder, query, count)
+        result = json.dumps(results, indent=2, default=str)
         if should_cache_contact_result(result, tool="search_contacts"):
             contact_cache.set(cache_key, result)
         return result
+
+    try:
+        return await bridge.call(_search, normalized, count, account)
     except Exception as e:
         return format_bridge_exception(e, action="searching contacts")
 
@@ -2014,38 +2102,59 @@ async def resolve_recipient(name: str, account: str = "") -> str:
     normalized_name = name.strip()
     if not normalized_name:
         return "Error: name must not be empty"
-    cache_key = contact_cache.make_key(
-        "resolve_recipient", name=normalized_name, account=account
-    )
-    cached = contact_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
     def _resolve(outlook, namespace, name, account):
-        _ = _require_store(namespace, account)  # validate account if provided
-        recipient = outlook.CreateRecipient(name)
-        resolved = recipient.Resolve()
-        if not resolved:
-            return json.dumps({
-                "resolved": False,
-                "name": name,
-                "email": "",
-                "address_type": "",
-                "message": "Could not resolve recipient",
-            }, indent=2)
-        entry = recipient.AddressEntry
-        return json.dumps({
-            "resolved": True,
-            "name": entry.Name or name,
-            "email": entry.Address or "",
-            "address_type": getattr(entry, "Type", "") or "",
-        }, indent=2, default=str)
+        store = _require_store(namespace, account)
+        cache_key = contact_cache.make_key(
+            "resolve_recipient",
+            store_id=store.StoreID,
+            name=name,
+            account=normalize_account_key(account),
+        )
+        cached = contact_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        folder = _get_contacts_folder(store)
+        gal_error: str | None = None
+        try:
+            recipient = outlook.CreateRecipient(name)
+            if recipient.Resolve():
+                entry = recipient.AddressEntry
+                result = json.dumps({
+                    "resolved": True,
+                    "name": entry.Name or name,
+                    "email": entry.Address or "",
+                    "address_type": getattr(entry, "Type", "") or "",
+                    "source": "gal",
+                }, indent=2, default=str)
+                if should_cache_contact_result(result, tool="resolve_recipient"):
+                    contact_cache.set(cache_key, result)
+                return result
+        except Exception as exc:
+            gal_error = format_com_error(exc)
+            logger.warning("GAL resolve failed for %r: %s", name, gal_error)
+
+        local = _resolve_via_contacts_folder(folder, name)
+        if local is not None:
+            result = json.dumps(local, indent=2, default=str)
+            if should_cache_contact_result(result, tool="resolve_recipient"):
+                contact_cache.set(cache_key, result)
+            return result
+
+        payload = {
+            "resolved": False,
+            "name": name,
+            "email": "",
+            "address_type": "",
+            "message": (
+                "Could not resolve via Global Address List or local Contacts."
+            ),
+        }
+        if gal_error:
+            payload["gal_error"] = gal_error
+        return json.dumps(payload, indent=2)
 
     try:
-        result = await bridge.call(_resolve, normalized_name, account)
-        if should_cache_contact_result(result, tool="resolve_recipient"):
-            contact_cache.set(cache_key, result)
-        return result
+        return await bridge.call(_resolve, normalized_name, account)
     except Exception as e:
         return format_bridge_exception(e, action="resolving recipient")
 
@@ -2472,9 +2581,11 @@ def _require_draft(namespace, entry_id: str, account: str):
             )
     except ValueError:
         raise
-    except Exception:
-        # If we can't verify parent for any reason, fall back to the Sent check.
-        pass
+    except Exception as e:
+        raise ValueError(
+            "Could not verify item is in the Drafts folder; refusing draft "
+            f"operation: {format_com_error(e)}"
+        ) from e
     return mail
 
 

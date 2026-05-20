@@ -41,6 +41,13 @@ def test_make_key_stable_for_same_params():
     assert k1 == k2
 
 
+def test_make_key_differs_by_store_id():
+    cache = ContactCache()
+    k1 = cache.make_key("list_contacts", store_id="store-a", count=10, account="")
+    k2 = cache.make_key("list_contacts", store_id="store-b", count=10, account="")
+    assert k1 != k2
+
+
 def test_make_key_differs_for_different_params():
     cache = ContactCache()
     k1 = cache.make_key("search_contacts", query="bob", count=20)

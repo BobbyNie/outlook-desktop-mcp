@@ -1,5 +1,6 @@
 """Helpers for building and parsing AppleScript safely."""
 import re
+import unicodedata
 from datetime import datetime
 
 
@@ -15,6 +16,13 @@ def escape(text: str) -> str:
     line separators (U+2028, U+2029) that AppleScript may treat as statement
     terminators in some contexts.
     """
+    text = unicodedata.normalize("NFKC", text)
+    text = (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
     text = text.replace("\\", "\\\\")
     text = text.replace('"', '\\"')
     text = text.replace("\n", "\\n")
@@ -47,12 +55,24 @@ def validate_mac_entry_id(entry_id) -> str:
     simple strip, or punctuation — are rejected to prevent AppleScript
     injection through string interpolation.
     """
-    s = str(entry_id).strip()
-    if not _MAC_ENTRY_ID_RE.match(s):
+    s = unicodedata.normalize("NFKC", str(entry_id)).strip()
+    if not re.fullmatch(r"[0-9]{1,32}", s):
         raise InvalidEntryIdError(
             f"Invalid entry_id (must be a positive integer up to 32 digits): {entry_id!r}"
         )
     return s
+
+
+def split_delimited_record(record: str, delim: str, field_count: int) -> list[str] | None:
+    """Split a fixed-width delimited record without delimiter bleed into tail fields.
+
+    Uses ``str.split(delim, field_count - 1)`` so delimiter bytes inside the
+    last field (e.g. subject lines) do not shift earlier columns.
+    """
+    parts = record.split(delim, field_count - 1)
+    if len(parts) != field_count:
+        return None
+    return parts
 
 
 class InvalidScriptIntError(ValueError):

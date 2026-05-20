@@ -26,6 +26,7 @@ from outlook_desktop_mcp.utils.applescript_helpers import (
     format_date,
     parse_date,
     resolve_folder_ref,
+    split_delimited_record,
     validate_mac_entry_id,
 )
 from outlook_desktop_mcp.utils.attachment_safety import (
@@ -454,8 +455,8 @@ end tell'''
                 record = record.strip()
                 if not record:
                     continue
-                parts = record.split(DELIM)
-                if len(parts) < 7:
+                parts = split_delimited_record(record, DELIM, 7)
+                if parts is None:
                     continue
                 att_count = int(parts[6]) if parts[6].strip().isdigit() else 0
                 results.append({
@@ -868,8 +869,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 3:
+            parts = split_delimited_record(record, DELIM, 3)
+            if parts is None:
                 continue
             path = parts[0].strip()
             results.append({
@@ -955,8 +956,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
+            parts = split_delimited_record(record, DELIM, 7)
+            if parts is None:
                 continue
             att_count = int(parts[6].strip()) if parts[6].strip().isdigit() else 0
             results.append({
@@ -1053,8 +1054,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
+            parts = split_delimited_record(record, DELIM, 7)
+            if parts is None:
                 continue
             start_str = parts[2].strip()
             parsed_start = parse_date(start_str)
@@ -1427,15 +1428,22 @@ async def search_events(
         safe_count = coerce_script_int(count, default=10, lo=1, hi=200, name="count")
     except InvalidScriptIntError as e:
         return f"Error: {e}"
+    try:
+        start = datetime.fromisoformat(start_date) if start_date else datetime.now() - timedelta(days=30)
+        end = datetime.fromisoformat(end_date) if end_date else datetime.now() + timedelta(days=30)
+    except ValueError as e:
+        return f"Error: invalid date ({e})"
+
     safe_query = escape(query)
+    fetch_limit = max(safe_count * 10, 200)
 
     script = f'''tell application "Microsoft Outlook"
     set evts to calendar events whose subject contains "{safe_query}"
     set evtCount to count of evts
-    set maxCount to {safe_count}
-    if evtCount < maxCount then set maxCount to evtCount
+    set maxFetch to {fetch_limit}
+    if evtCount < maxFetch then set maxFetch to evtCount
     set output to ""
-    repeat with i from 1 to maxCount
+    repeat with i from 1 to maxFetch
         set e to item i of evts
         set eid to id of e
         set esubject to subject of e
@@ -1460,23 +1468,43 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
+        query_lower = query.lower()
+        candidates = []
         for record in raw.split(RECORD_DELIM):
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
+            parts = split_delimited_record(record, DELIM, 7)
+            if parts is None:
                 continue
-            results.append({
+            if query_lower not in (parts[1] or "").lower():
+                continue
+            start_str = parts[2].strip()
+            parsed_start = parse_date(start_str)
+            try:
+                start_dt = datetime.fromisoformat(parsed_start)
+            except ValueError:
+                start_dt = None
+            candidates.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
+                "start": parsed_start if start_dt else start_str,
+                "end": parse_date(parts[3].strip()),
                 "location": _clean(parts[4]),
                 "organizer": _clean(parts[5]),
                 "all_day": parts[6].strip().lower() == "true",
+                "_start_dt": start_dt,
             })
+
+        filtered = [
+            e for e in candidates
+            if e["_start_dt"] is not None and start <= e["_start_dt"] <= end
+        ]
+        filtered.sort(key=lambda e: e["_start_dt"])
+        results = [
+            {k: v for k, v in e.items() if not k.startswith("_")}
+            for e in filtered[:safe_count]
+        ]
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error searching events: {e}"
@@ -1541,8 +1569,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 5:
+            parts = split_delimited_record(record, DELIM, 5)
+            if parts is None:
                 continue
             results.append({
                 "entry_id": parts[0].strip(),
@@ -1757,8 +1785,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 3:
+            parts = split_delimited_record(record, DELIM, 3)
+            if parts is None:
                 continue
             results.append({
                 "index": int(parts[0].strip()) if parts[0].strip().isdigit() else 0,
@@ -2125,8 +2153,8 @@ end tell'''
             record = record.strip()
             if not record:
                 continue
-            parts = record.split(DELIM)
-            if len(parts) < 8:
+            parts = split_delimited_record(record, DELIM, 8)
+            if parts is None:
                 continue
             results.append({
                 "entry_id": parts[0].strip(),
