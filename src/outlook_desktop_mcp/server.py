@@ -2059,32 +2059,65 @@ _PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
 _PR_ATTACH_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
 
 
-def _attach_inline_image(mail, abs_path: str, cid: str) -> None:
-    """Attach a file as an inline image with the given Content-ID."""
+def _attach_inline_image(mail, abs_path: str, cid: str) -> bool:
+    """Attach a file as an inline image with the given Content-ID.
+
+    Returns True if both PR_ATTACH_CONTENT_ID and PR_ATTACH_HIDDEN were set
+    (so the recipient should see it as truly inline), False if either MAPI
+    SetProperty call failed (in which case the attachment is still present
+    but will likely render as a regular attachment).
+    """
     display = suggest_attachment_basename(abs_path)
     attachment = mail.Attachments.Add(abs_path, _OL_ATTACH_BY_VALUE, 0, display)
     try:
+        attachment.DisplayName = display
+    except Exception:
+        pass
+    try:
         attachment.PropertyAccessor.SetProperty(_PR_ATTACH_CONTENT_ID, cid)
         attachment.PropertyAccessor.SetProperty(_PR_ATTACH_HIDDEN, True)
+        return True
     except Exception as e:
         logger.warning("Could not set inline-image properties for %s: %s", abs_path, e)
+        return False
 
 
-def _apply_draft_body(mail, body: str, html_body: str, inline_images) -> None:
+def _apply_draft_body(
+    mail,
+    body,
+    html_body,
+    inline_images,
+) -> list[dict]:
     """Populate a draft mail item with body, HTML body, and inline images.
 
-    HTML wins when supplied. Plain ``body`` is always set as text fallback so
-    clients that ignore HTML still see something. Inline images are added with
-    ``cid:`` references; ``inline_images`` may be paths or dicts (see
-    :func:`utils.draft_html.prepare_inline_html`).
+    ``body`` and ``html_body`` may be ``None`` to leave the existing value
+    untouched, or any string (including ``""``) to set/clear that field.
+    ``inline_images`` may be ``None``/``[]`` (no change) or a list of entries
+    accepted by :func:`utils.draft_html.prepare_inline_html`.
+
+    Returns a list of dicts describing any inline-image attachments that
+    could not have their Content-ID metadata set; callers should surface
+    these to the user so they know inline rendering will fall back to a
+    regular attachment.
     """
-    if body:
+    if body is not None:
         mail.Body = body
-    if html_body or inline_images:
-        final_html, cid_pairs = prepare_inline_html(body, html_body, inline_images)
+
+    failures: list[dict] = []
+    if html_body is not None or inline_images:
+        effective_body = body if body is not None else (mail.Body or "")
+        effective_html = html_body if html_body is not None else (
+            getattr(mail, "HTMLBody", "") or ""
+        )
+        final_html, cid_pairs = prepare_inline_html(
+            effective_body, effective_html, inline_images
+        )
         mail.HTMLBody = final_html
         for cid, abs_path in cid_pairs:
-            _attach_inline_image(mail, abs_path, cid)
+            ok = _attach_inline_image(mail, abs_path, cid)
+            if not ok:
+                failures.append({"cid": cid, "path": abs_path})
+    return failures
 
 
 def _add_regular_attachments(mail, attachments) -> list[str]:
@@ -2277,13 +2310,21 @@ async def create_draft(
         mail = outlook.CreateItem(OL_MAIL_ITEM)
         if account:
             store = _require_store(namespace, account)
+            sender_account = _resolve_account_object(outlook, store)
+            if sender_account is None:
+                raise ValueError(
+                    f"Account '{account}' is a store but has no matching mail account "
+                    "(no DeliveryStore match). Refusing to create a draft that would "
+                    "later send from the default identity."
+                )
             drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+            # Save first so Move() has a real item to relocate, then re-pick up
+            # the moved item.
+            mail.Save()
             moved = mail.Move(drafts)
             if moved is not None:
                 mail = moved
-            sender_account = _resolve_account_object(outlook, store)
-            if sender_account is not None:
-                mail._oleobj_.Invoke(*(_PR_SEND_USING_ACCOUNT, 0, 8, 0, sender_account))
+            mail._oleobj_.Invoke(*(_PR_SEND_USING_ACCOUNT, 0, 8, 0, sender_account))
         mail.To = to or ""
         mail.Subject = subject
         if cc:
@@ -2291,12 +2332,19 @@ async def create_draft(
         if bcc:
             mail.BCC = bcc
         try:
-            _apply_draft_body(mail, body, html_body, inline_images)
+            inline_failures = _apply_draft_body(mail, body, html_body, inline_images)
             _add_regular_attachments(mail, attachments)
         except (InvalidInlineImage, ValueError) as e:
             return f"Error: {e}"
         mail.Save()
-        return json.dumps({"status": "created", **_draft_summary(mail)}, indent=2, default=str)
+        result = {"status": "created", **_draft_summary(mail)}
+        if inline_failures:
+            result["inline_image_failures"] = inline_failures
+            result["warning"] = (
+                "Some inline images could not be tagged with Content-ID; they will "
+                "render as regular attachments instead of being embedded inline."
+            )
+        return json.dumps(result, indent=2, default=str)
 
     try:
         return await bridge.call(
@@ -2342,9 +2390,7 @@ async def update_draft(
     def _update(outlook, namespace, entry_id, to, subject, body, cc, bcc,
                 html_body, inline_images, attachments, replace_attachments,
                 account):
-        mail = _get_item_for_account(namespace, entry_id, account)
-        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
-            return err
+        mail = _require_draft(namespace, entry_id, account)
         if to is not None:
             mail.To = to
         if subject is not None:
@@ -2361,14 +2407,11 @@ async def update_draft(
                 except Exception:
                     break
 
+        inline_failures: list = []
         if body is not None or html_body is not None or inline_images:
-            effective_body = body if body is not None else (mail.Body or "")
-            effective_html = html_body if html_body is not None else (
-                getattr(mail, "HTMLBody", "") or ""
-            )
             try:
-                _apply_draft_body(
-                    mail, effective_body, effective_html, inline_images
+                inline_failures = _apply_draft_body(
+                    mail, body, html_body, inline_images
                 )
             except InvalidInlineImage as e:
                 return f"Error: {e}"
@@ -2379,7 +2422,10 @@ async def update_draft(
             return f"Error: {e}"
 
         mail.Save()
-        return json.dumps({"status": "updated", **_draft_summary(mail)}, indent=2, default=str)
+        result = {"status": "updated", **_draft_summary(mail)}
+        if inline_failures:
+            result["inline_image_failures"] = inline_failures
+        return json.dumps(result, indent=2, default=str)
 
     try:
         return await bridge.call(
@@ -2390,9 +2436,39 @@ async def update_draft(
         return f"Error updating draft: {format_com_error(e)}"
 
 
+def _require_draft(namespace, entry_id: str, account: str):
+    """Resolve a draft mail item; raise if it's already sent or not in Drafts."""
+    mail = _get_item_for_account(namespace, entry_id, account)
+    if mail.Class != _OL_CLASS_MAIL:
+        raise ValueError("Entry ID does not refer to a mail item.")
+    if bool(getattr(mail, "Sent", False)):
+        raise ValueError(
+            "This mail item has already been sent — refusing to operate on it via "
+            "a draft tool. Use the regular email tools instead."
+        )
+    try:
+        store = _require_store(namespace, account) if account else namespace.DefaultStore
+        drafts_id = store.GetDefaultFolder(OL_FOLDER_DRAFTS).EntryID
+        parent_id = mail.Parent.EntryID
+        if parent_id != drafts_id:
+            raise ValueError(
+                "This mail item is not in the Drafts folder — refusing to operate "
+                "on it via a draft tool."
+            )
+    except ValueError:
+        raise
+    except Exception:
+        # If we can't verify parent for any reason, fall back to the Sent check.
+        pass
+    return mail
+
+
 @mcp.tool()
 async def send_draft(entry_id: str, account: str = "") -> str:
     """Send a previously saved draft email.
+
+    Rejects items that have already been sent or that are not in the Drafts
+    folder; use the regular reply/send tools for those.
 
     Args:
         entry_id: The unique Outlook EntryID of the draft to send.
@@ -2402,9 +2478,7 @@ async def send_draft(entry_id: str, account: str = "") -> str:
         Confirmation with the sent subject, or an error.
     """
     def _send(outlook, namespace, entry_id, account):
-        mail = _get_item_for_account(namespace, entry_id, account)
-        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
-            return err
+        mail = _require_draft(namespace, entry_id, account)
         subject = mail.Subject or "(no subject)"
         recipients = mail.To or ""
         mail.Send()
@@ -2422,7 +2496,10 @@ async def send_draft(entry_id: str, account: str = "") -> str:
 
 @mcp.tool()
 async def delete_draft(entry_id: str, account: str = "") -> str:
-    """Permanently delete a draft email.
+    """Delete a draft email (moves it to Deleted Items — not a hard delete).
+
+    Rejects items that have already been sent or that are not in the Drafts
+    folder. To recover, look in the Deleted Items folder.
 
     Args:
         entry_id: The unique Outlook EntryID of the draft.
@@ -2432,12 +2509,10 @@ async def delete_draft(entry_id: str, account: str = "") -> str:
         Confirmation with the deleted subject, or an error.
     """
     def _delete(outlook, namespace, entry_id, account):
-        mail = _get_item_for_account(namespace, entry_id, account)
-        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
-            return err
+        mail = _require_draft(namespace, entry_id, account)
         subject = mail.Subject or "(no subject)"
         mail.Delete()
-        return f"Draft deleted: '{subject}'"
+        return f"Draft moved to Deleted Items: '{subject}'"
 
     try:
         return await bridge.call(_delete, entry_id, account)

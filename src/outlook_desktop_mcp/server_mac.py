@@ -1986,19 +1986,19 @@ async def resolve_recipient(name: str, account: str = "") -> str:
 # content`` and will be rendered by the recipient's mail client.
 
 
-def _build_recipient_lines(addresses: str, kind: str) -> str:
+def _build_recipient_lines(addresses: str, kind: str, target: str = "newMsg") -> str:
     lines = ""
     for addr in (addresses or "").split(";"):
         addr = addr.strip()
         if addr:
             lines += (
-                f'make new {kind} at newMsg with properties '
+                f'make new {kind} at {target} with properties '
                 f'{{email address:{{address:"{escape(addr)}"}}}}\n'
             )
     return lines
 
 
-def _build_attachment_lines(paths: list | None) -> str:
+def _build_attachment_lines_at(paths: list | None, target: str = "newMsg") -> str:
     lines = ""
     if not paths:
         return lines
@@ -2011,10 +2011,14 @@ def _build_attachment_lines(paths: list | None) -> str:
         if not os.path.isfile(abs_path):
             raise ValueError(f"attachment file does not exist: {entry!r}")
         lines += (
-            f'make new attachment at newMsg with properties '
+            f'make new attachment at {target} with properties '
             f'{{file:POSIX file "{escape(abs_path)}"}}\n'
         )
     return lines
+
+
+def _build_attachment_lines(paths: list | None) -> str:
+    return _build_attachment_lines_at(paths, target="newMsg")
 
 
 @mcp.tool()
@@ -2049,6 +2053,25 @@ async def list_drafts(count: int = 20, account: str = "") -> str:
                 set mto to mto & address of r & "; "
             end repeat
         end try
+        set mcc to ""
+        try
+            set ccrecips to cc recipients of m
+            repeat with r in ccrecips
+                set mcc to mcc & address of r & "; "
+            end repeat
+        end try
+        set mbcc to ""
+        try
+            set bccrecips to bcc recipients of m
+            repeat with r in bccrecips
+                set mbcc to mbcc & address of r & "; "
+            end repeat
+        end try
+        set mhasHtml to "false"
+        try
+            set htxt to content of m
+            if (count of htxt) > 0 then set mhasHtml to "true"
+        end try
         set mtime to ""
         try
             set mtime to time received of m as string
@@ -2057,7 +2080,7 @@ async def list_drafts(count: int = 20, account: str = "") -> str:
         try
             set mattcount to count of attachments of m
         end try
-        set output to output & mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mtime & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+        set output to output & mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mhasHtml & "{DELIM}" & mtime & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
     end repeat
     return output
 end tell'''
@@ -2070,14 +2093,17 @@ end tell'''
             if not record:
                 continue
             parts = record.split(DELIM)
-            if len(parts) < 5:
+            if len(parts) < 8:
                 continue
             results.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
                 "to": parts[2].strip(),
-                "last_modified": _clean(parts[3]),
-                "attachment_count": int(parts[4]) if parts[4].strip().isdigit() else 0,
+                "cc": parts[3].strip(),
+                "bcc": parts[4].strip(),
+                "has_html": parts[5].strip().lower() == "true",
+                "last_modified": _clean(parts[6]),
+                "attachment_count": int(parts[7]) if parts[7].strip().isdigit() else 0,
             })
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
@@ -2125,6 +2151,10 @@ async def get_draft(entry_id: str, account: str = "") -> str:
     try
         set mhtml to content of m
     end try
+    set mtime to ""
+    try
+        set mtime to time received of m as string
+    end try
     set attLines to ""
     try
         set attList to attachments of m
@@ -2142,14 +2172,14 @@ async def get_draft(entry_id: str, account: str = "") -> str:
             set attLines to attLines & (i as text) & "{DELIM}" & aname & "{DELIM}" & (asize as text) & "{RECORD_DELIM}"
         end repeat
     end try
-    return mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody & "{DELIM}" & mhtml & "{DELIM}{DELIM}" & attLines
+    return mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody & "{DELIM}" & mhtml & "{DELIM}" & mtime & "{DELIM}{DELIM}" & attLines
 end tell'''
 
     try:
         raw = await bridge.run(script)
         head, _, attbuf = raw.partition(f"{DELIM}{DELIM}")
-        parts = head.split(DELIM, 5)
-        if len(parts) < 6:
+        parts = head.split(DELIM, 6)
+        if len(parts) < 7:
             return json.dumps({"error": "Failed to parse draft data"})
 
         attachments = []
@@ -2173,6 +2203,7 @@ end tell'''
             "cc": parts[3].strip(),
             "body": _truncate(_clean(parts[4])),
             "html_body": _clean(parts[5]),
+            "last_modified": _clean(parts[6]),
             "attachments": attachments,
         }
         return json.dumps(result, indent=2, default=str)
@@ -2285,15 +2316,14 @@ async def update_draft(
 
     set_lines = ""
     if to is not None:
-        # Rebuild recipients: clear all then add
-        set_lines += 'try\n        delete (to recipients of m)\n    end try\n    '
-        set_lines += _build_recipient_lines(to, "to recipient").replace("newMsg", "m") + "    "
+        set_lines += 'delete every to recipient of m\n    '
+        set_lines += _build_recipient_lines(to, "to recipient", target="m") + "    "
     if cc is not None:
-        set_lines += 'try\n        delete (cc recipients of m)\n    end try\n    '
-        set_lines += _build_recipient_lines(cc, "cc recipient").replace("newMsg", "m") + "    "
+        set_lines += 'delete every cc recipient of m\n    '
+        set_lines += _build_recipient_lines(cc, "cc recipient", target="m") + "    "
     if bcc is not None:
-        set_lines += 'try\n        delete (bcc recipients of m)\n    end try\n    '
-        set_lines += _build_recipient_lines(bcc, "bcc recipient").replace("newMsg", "m") + "    "
+        set_lines += 'delete every bcc recipient of m\n    '
+        set_lines += _build_recipient_lines(bcc, "bcc recipient", target="m") + "    "
     if subject is not None:
         set_lines += f'set subject of m to "{escape(subject)}"\n    '
     if body is not None:
@@ -2304,15 +2334,15 @@ async def update_draft(
     image_paths = [p for _, p in cid_pairs]
     try:
         att_lines_combined = (
-            _build_attachment_lines(image_paths).replace("newMsg", "m")
-            + _build_attachment_lines(attachments).replace("newMsg", "m")
+            _build_attachment_lines_at(image_paths, target="m")
+            + _build_attachment_lines_at(attachments, target="m")
         )
     except ValueError as e:
         return f"Error: {e}"
 
     replace_block = ""
     if replace_attachments:
-        replace_block = "try\n        delete (attachments of m)\n    end try\n    "
+        replace_block = "delete every attachment of m\n    "
 
     if not (set_lines or att_lines_combined or replace_attachments):
         return json.dumps({"error": "No fields to update"})
@@ -2364,7 +2394,10 @@ end tell'''
 
 @mcp.tool()
 async def delete_draft(entry_id: str, account: str = "") -> str:
-    """Permanently delete a macOS draft. account is ignored on macOS."""
+    """Delete a macOS draft (moves it to Deleted Items, not a hard delete).
+
+    account is ignored on macOS.
+    """
     try:
         entry_id = validate_mac_entry_id(entry_id)
     except InvalidEntryIdError as e:

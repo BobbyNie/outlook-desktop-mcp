@@ -96,3 +96,24 @@ def test_suggest_attachment_basename_strips_dirs():
     name = suggest_attachment_basename("/usr/bin/evil.exe")
     assert "/" not in name
     assert name.endswith(".txt")  # dangerous extension neutralized
+
+
+def test_cid_substring_boundary_does_not_false_match(tmp_path):
+    """cid:logo1 in html must not be considered a reference if html has cid:logo10."""
+    img = tmp_path / "logo.png"
+    img.write_bytes(b"x")
+    body_html = '<p><img src="cid:logo10"></p>'
+    html, images = prepare_inline_html(
+        "",
+        body_html,
+        [{"path": str(img), "cid": "logo1"}],
+    )
+    assert "cid:logo10" in html
+    assert "cid:logo1" in html
+    assert images == [("logo1", str(img))]
+
+
+def test_plain_to_html_normalizes_crlf():
+    out = plain_to_html("line1\r\nline2\rline3")
+    assert "<br>line2<br>line3" in out
+    assert "\r" not in out

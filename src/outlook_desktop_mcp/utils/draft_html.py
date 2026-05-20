@@ -25,6 +25,8 @@ import re
 from html import escape as html_escape
 from typing import Iterable
 
+_CID_REFERENCE_BOUNDARY = re.compile(r"[A-Za-z0-9._\-]")
+
 from outlook_desktop_mcp.utils.attachment_safety import (
     UnsafeAttachmentPath,
     sanitize_attachment_filename,
@@ -81,12 +83,32 @@ def _normalize_image_entry(entry, index: int) -> tuple[str, str, str | None]:
 
 def plain_to_html(body: str) -> str:
     """Convert a plain-text body to safe HTML (escape + wrap paragraphs)."""
-    escaped = html_escape(body or "", quote=False)
-    paragraphs = [p for p in escaped.split("\n\n")]
+    normalized = (body or "").replace("\r\n", "\n").replace("\r", "\n")
+    escaped = html_escape(normalized, quote=False)
+    paragraphs = escaped.split("\n\n")
     return "".join(
         "<p>" + p.replace("\n", "<br>") + "</p>"
         for p in paragraphs
     ) or "<p></p>"
+
+
+def _cid_already_referenced(html: str, cid: str) -> bool:
+    """True if ``cid`` is referenced inside an existing ``cid:`` URI in html.
+
+    Uses a non-CID-char boundary so that ``cid:logo1`` does not falsely match
+    ``cid:logo10``.
+    """
+    needle = f"cid:{cid}"
+    start = 0
+    while True:
+        idx = html.find(needle, start)
+        if idx == -1:
+            return False
+        end = idx + len(needle)
+        next_char = html[end:end + 1]
+        if not next_char or not _CID_REFERENCE_BOUNDARY.match(next_char):
+            return True
+        start = end
 
 
 def prepare_inline_html(
@@ -116,7 +138,7 @@ def prepare_inline_html(
         img_tag = f'<img src="cid:{cid}" alt="">'
         if placeholder and placeholder in html:
             html = html.replace(placeholder, img_tag)
-        elif f"cid:{cid}" not in html:
+        elif not _cid_already_referenced(html, cid):
             html = html + f'<p>{img_tag}</p>'
 
     return html, [(cid, path) for cid, path, _ in normalized]
