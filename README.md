@@ -116,7 +116,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes* | Search subjects + bodies (Windows). macOS scans subjects only. |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |

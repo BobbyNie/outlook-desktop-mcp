@@ -16,6 +16,22 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
+from outlook_desktop_mcp.utils.applescript_helpers import (
+    DELIM,
+    RECORD_DELIM,
+    InvalidEntryIdError,
+    escape,
+    format_date,
+    parse_date,
+    resolve_folder_ref,
+    validate_mac_entry_id,
+)
+from outlook_desktop_mcp.utils.attachment_safety import (
+    UnsafeAttachmentPath,
+    ensure_save_directory,
+    resolve_attachment_path,
+    sanitize_attachment_filename,
+)
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
@@ -24,14 +40,6 @@ from outlook_desktop_mcp.utils.contact_helpers import (
     sort_contacts_by_name,
 )
 from outlook_desktop_mcp.utils.contact_mac import parse_mac_contact_records
-from outlook_desktop_mcp.utils.applescript_helpers import (
-    escape,
-    format_date,
-    parse_date,
-    resolve_folder_ref,
-    DELIM,
-    RECORD_DELIM,
-)
 from datetime import datetime, timedelta
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
@@ -431,7 +439,7 @@ end tell'''
                     "sender": parts[2].strip(),
                     "sender_name": parts[3].strip(),
                     "received_time": _clean(parts[4]),
-                    "unread": parts[5].strip().lower() != "true",  # is_read -> unread
+                    "unread": _read_email_unread_flag(parts[5]),
                     "has_attachments": att_count > 0,
                     "attachment_count": att_count,
                 })
@@ -442,8 +450,12 @@ end tell'''
         if not results and folder.lower().strip() == "inbox":
             try:
                 results = await _ui_list_messages(bridge, count)
-            except Exception:
-                pass  # UI scraping failed — return empty list
+            except Exception as ui_err:
+                logger.warning(
+                    "UI scraping fallback for inbox failed: %s. "
+                    "Check Accessibility permission for python3 in System Settings.",
+                    ui_err,
+                )
 
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
@@ -479,7 +491,10 @@ async def read_email(
         sender_name, received_time, unread, to, cc, body, attachment info).
     """
     if entry_id:
-        folder_ref = resolve_folder_ref(folder)
+        try:
+            entry_id = validate_mac_entry_id(entry_id)
+        except InvalidEntryIdError as e:
+            return f"Error: {e}"
         script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set mid to id of m
@@ -581,7 +596,7 @@ end tell'''
             "sender": parts[2].strip(),
             "sender_name": parts[3].strip(),
             "received_time": _clean(parts[4]),
-            "unread": parts[5].strip().lower() != "true",
+            "unread": _read_email_unread_flag(parts[5]),
             "has_attachments": att_count > 0,
             "attachment_count": att_count,
             "to": parts[7].strip(),
@@ -591,6 +606,15 @@ end tell'''
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error reading email: {e}"
+
+
+def _read_email_unread_flag(parts5: str) -> bool:
+    """Map ``is read`` AppleScript output to unread flag.
+
+    AppleScript returns ``true``/``false`` (lowercase). We compare positively to
+    avoid the inversion trap when a future build changes the casing.
+    """
+    return parts5.strip().lower() == "false"
 
 
 # =====================================================================
@@ -611,6 +635,10 @@ async def mark_as_read(entry_id: str) -> str:
     Returns:
         Confirmation message with the email subject, or an error.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set is read of m to true
@@ -642,6 +670,10 @@ async def mark_as_unread(entry_id: str) -> str:
     Returns:
         Confirmation message with the email subject, or an error.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set is read of m to false
@@ -679,6 +711,10 @@ async def move_email(
     Returns:
         Confirmation with email subject and destination, or an error.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     dest_ref = resolve_folder_ref(target_folder)
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
@@ -719,6 +755,10 @@ async def reply_email(
     Returns:
         Confirmation indicating the reply was sent, or an error.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     reply_cmd = "reply all to" if reply_all else "reply to"
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
@@ -750,19 +790,45 @@ async def list_folders(max_depth: int = 2) -> str:
 
     Args:
         max_depth: How many levels deep to recurse into subfolders.
-            Default 2. Set to 1 for top-level only.
+            Default 2. Set to 1 for top-level only. Capped at 5 to avoid
+            runaway recursion on deeply nested mailboxes.
 
     Returns:
-        JSON array of folder objects with name, item_count, and unread_count.
+        JSON array of folder objects with name, path, item_count, and
+        unread_count.
     """
-    script = f'''tell application "Microsoft Outlook"
-    set allFolders to mail folders
-    set output to ""
-    repeat with f in allFolders
-        set fname to name of f
+    depth = max(1, min(int(max_depth) if isinstance(max_depth, int) else 2, 5))
+
+    script = f'''on collectFolder(f, prefix, depthRemaining, output, sep, rsep)
+    set fname to name of f
+    set fpath to prefix & fname
+    set fcount to 0
+    try
         set fcount to count of messages of f
+    end try
+    set funread to 0
+    try
         set funread to unread count of f
-        set output to output & fname & "{DELIM}" & (fcount as text) & "{DELIM}" & (funread as text) & "{RECORD_DELIM}"
+    end try
+    set output to output & fpath & sep & (fcount as text) & sep & (funread as text) & rsep
+    if depthRemaining > 1 then
+        try
+            set subs to mail folders of f
+            repeat with sf in subs
+                set output to my collectFolder(sf, fpath & "/", depthRemaining - 1, output, sep, rsep)
+            end repeat
+        end try
+    end if
+    return output
+end collectFolder
+
+tell application "Microsoft Outlook"
+    set sep to "{DELIM}"
+    set rsep to "{RECORD_DELIM}"
+    set output to ""
+    set allFolders to mail folders
+    repeat with f in allFolders
+        set output to my collectFolder(f, "", {depth}, output, sep, rsep)
     end repeat
     return output
 end tell'''
@@ -780,8 +846,10 @@ end tell'''
             parts = record.split(DELIM)
             if len(parts) < 3:
                 continue
+            path = parts[0].strip()
             results.append({
-                "name": parts[0].strip(),
+                "name": path.rsplit("/", 1)[-1],
+                "path": path,
                 "item_count": int(parts[1].strip()) if parts[1].strip().isdigit() else 0,
                 "unread_count": int(parts[2].strip()) if parts[2].strip().isdigit() else 0,
             })
@@ -909,12 +977,16 @@ async def list_events(
     Returns:
         JSON array of event summary objects.
     """
-    start = datetime.fromisoformat(start_date) if start_date else datetime.now()
-    end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
+    try:
+        start = datetime.fromisoformat(start_date) if start_date else datetime.now()
+        end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
+    except ValueError as e:
+        return f"Error: invalid date ({e})"
 
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
+    # AppleScript ``whose`` date filtering on Outlook for Mac is unreliable, so
+    # we filter and sort in Python. Cap fetch to a sane upper bound to avoid
+    # iterating the entire calendar on busy mailboxes.
+    fetch_limit = max(count * 5, 100)
 
     script = f'''tell application "Microsoft Outlook"
     set evts to calendar events
@@ -947,7 +1019,7 @@ end tell'''
         if not raw:
             return json.dumps([])
 
-        results = []
+        candidates = []
         for record in raw.split(RECORD_DELIM):
             record = record.strip()
             if not record:
@@ -955,15 +1027,29 @@ end tell'''
             parts = record.split(DELIM)
             if len(parts) < 7:
                 continue
-            results.append({
+            start_str = parts[2].strip()
+            parsed_start = parse_date(start_str)
+            try:
+                start_dt = datetime.fromisoformat(parsed_start)
+            except ValueError:
+                start_dt = None
+            candidates.append({
                 "entry_id": parts[0].strip(),
                 "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
+                "start": parsed_start if start_dt else start_str,
+                "end": parse_date(parts[3].strip()),
                 "location": _clean(parts[4]),
                 "organizer": _clean(parts[5]),
                 "all_day": parts[6].strip().lower() == "true",
+                "_start_dt": start_dt,
             })
+
+        filtered = [
+            e for e in candidates
+            if e["_start_dt"] is not None and start <= e["_start_dt"] <= end
+        ]
+        filtered.sort(key=lambda e: e["_start_dt"])
+        results = [{k: v for k, v in e.items() if not k.startswith("_")} for e in filtered[:count]]
         return json.dumps(results, indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
@@ -987,6 +1073,10 @@ async def get_event(entry_id: str) -> str:
     Returns:
         JSON object with full event details.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set e to calendar event id {entry_id}
     set eid to id of e
@@ -1216,6 +1306,11 @@ async def update_event(
     if not set_lines:
         return json.dumps({"error": "No fields to update"})
 
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
+
     script = f'''tell application "Microsoft Outlook"
     set e to calendar event id {entry_id}
     {set_lines}
@@ -1255,6 +1350,10 @@ async def delete_event(entry_id: str) -> str:
     Returns:
         Confirmation with the event subject, or an error.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set e to calendar event id {entry_id}
     set esubject to subject of e
@@ -1430,6 +1529,10 @@ async def get_task(entry_id: str) -> str:
     Returns:
         JSON object with full task details including body.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set t to task id {entry_id}
     set tid to id of t
@@ -1530,6 +1633,10 @@ async def complete_task(entry_id: str) -> str:
     Returns:
         Confirmation with the task subject.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set t to task id {entry_id}
     set todo flag of t to completed
@@ -1553,6 +1660,10 @@ async def delete_task(entry_id: str) -> str:
     Returns:
         Confirmation with the task subject.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set t to task id {entry_id}
     set tname to name of t
@@ -1581,6 +1692,10 @@ async def list_attachments(entry_id: str) -> str:
     Returns:
         JSON array of attachment objects with index and filename.
     """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set attList to attachments of m
@@ -1638,50 +1753,52 @@ async def save_attachment(
     Returns:
         The full file path where the attachment was saved, or an error.
     """
-    if not save_directory:
-        save_directory = os.path.join(os.path.expanduser("~"), "Downloads")
-    os.makedirs(save_directory, exist_ok=True)
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
 
-    # Use POSIX path for AppleScript
-    save_dir_posix = save_directory
+    try:
+        save_dir = ensure_save_directory(save_directory)
+    except UnsafeAttachmentPath as e:
+        return f"Error: {e}"
 
-    script = f'''tell application "Microsoft Outlook"
-    set m to message id {entry_id}
-    set attList to attachments of m
-    set attCount to count of attList
-    if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s), requested index {attachment_index}"
-    set a to item {attachment_index} of attList
-    set aname to name of a
-    set savePath to POSIX file "{escape(save_dir_posix)}/{escape("__PLACEHOLDER__")}"
-    save a in file ((POSIX path of (POSIX file "{escape(save_dir_posix)}")) & aname)
-    return aname
-end tell'''
+    if not isinstance(attachment_index, int) or attachment_index < 1:
+        return "Error: attachment_index must be a positive integer"
 
-    # Simpler approach: save to known path
-    script = f'''tell application "Microsoft Outlook"
+    probe_script = f'''tell application "Microsoft Outlook"
     set m to message id {entry_id}
     set attList to attachments of m
     set attCount to count of attList
     if attCount < {attachment_index} then return "ERROR:Only " & attCount & " attachment(s)"
     set a to item {attachment_index} of attList
-    set aname to name of a
-    set savePath to "{escape(save_dir_posix)}/" & aname
-    save a in savePath
-    return aname & "{DELIM}" & savePath
+    return name of a
 end tell'''
 
     try:
-        raw = await bridge.run(script)
-        if raw.startswith("ERROR:"):
-            return raw
+        raw_name = await bridge.run(probe_script)
+        if raw_name.startswith("ERROR:"):
+            return raw_name
 
-        parts = raw.split(DELIM)
-        filename = parts[0].strip() if len(parts) > 0 else "unknown"
-        save_path = os.path.join(save_directory, filename)
+        safe_filename = sanitize_attachment_filename(raw_name)
+        try:
+            safe_path = resolve_attachment_path(save_dir, safe_filename)
+        except UnsafeAttachmentPath as e:
+            return f"Error: {e}"
+
+        save_script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    set a to item {attachment_index} of (attachments of m)
+    save a in POSIX file "{escape(safe_path)}"
+    return "ok"
+end tell'''
+        await bridge.run(save_script)
+
         result = {
             "status": "saved",
-            "filename": filename,
-            "path": save_path,
+            "filename": safe_filename,
+            "original_filename": raw_name,
+            "path": safe_path,
         }
         return json.dumps(result, indent=2, default=str)
     except Exception as e:

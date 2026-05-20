@@ -7,14 +7,31 @@ thread so the async MCP event loop never touches COM objects directly.
 Every COM function passed to bridge.call() receives (outlook, namespace, ...)
 as its first two arguments — the live COM objects that only exist on the
 COM thread.
+
+The bridge serializes work onto a single STA thread. To avoid one slow
+operation cascading into wedging the whole server, ``call`` supports a
+per-call timeout and refuses to queue a new request while a previous one
+is still in flight (the COM thread cannot be cancelled mid-COM-call).
 """
-import threading
-import queue
 import asyncio
-import sys
 import logging
+import os
+import queue
+import sys
+import threading
 
 logger = logging.getLogger("outlook_desktop_mcp.com_bridge")
+
+DEFAULT_CALL_TIMEOUT = float(os.environ.get("OUTLOOK_MCP_COM_TIMEOUT", "60"))
+DEFAULT_START_TIMEOUT = float(os.environ.get("OUTLOOK_MCP_COM_START_TIMEOUT", "15"))
+
+
+class ComBridgeBusyError(RuntimeError):
+    """Raised when a new COM request is submitted while another is in flight."""
+
+
+class ComBridgeTimeoutError(TimeoutError):
+    """Raised when a COM call exceeds its timeout."""
 
 
 class OutlookBridge:
@@ -28,18 +45,23 @@ class OutlookBridge:
         self._ready = threading.Event()
         self._shutdown = threading.Event()
         self._init_error: Exception | None = None
+        self._in_flight_lock = threading.Lock()
+        self._in_flight_label: str | None = None
 
-    def start(self):
+    def start(self, timeout: float = DEFAULT_START_TIMEOUT):
         """Start the COM thread. Call once at server startup."""
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("OutlookBridge.start() called twice; ignoring.")
+            return
         self._thread = threading.Thread(
             target=self._com_thread_main, daemon=True, name="outlook-com"
         )
         self._thread.start()
-        if not self._ready.wait(timeout=15):
+        if not self._ready.wait(timeout=timeout):
             if self._init_error:
                 raise self._init_error
             raise RuntimeError(
-                "Outlook COM thread failed to initialize within 15s. "
+                f"Outlook COM thread failed to initialize within {timeout}s. "
                 "Is Outlook Desktop (Classic) running?"
             )
 
@@ -50,11 +72,19 @@ class OutlookBridge:
 
         pythoncom.CoInitialize()
         try:
-            self._outlook = win32com.client.Dispatch("Outlook.Application")
-            self._namespace = self._outlook.GetNamespace("MAPI")
-            store_name = self._namespace.DefaultStore.DisplayName
-            user_name = self._namespace.CurrentUser.Name
-            logger.debug("COM thread ready. Store: %s, User: %s", store_name, user_name)
+            try:
+                self._outlook = win32com.client.Dispatch("Outlook.Application")
+                self._namespace = self._outlook.GetNamespace("MAPI")
+                store_name = self._namespace.DefaultStore.DisplayName
+                user_name = self._namespace.CurrentUser.Name
+                logger.debug(
+                    "COM thread ready. Store: %s, User: %s", store_name, user_name
+                )
+            except Exception as e:
+                self._init_error = e
+                logger.error("COM thread init failed: %s", e)
+                self._ready.set()
+                return
             self._ready.set()
 
             while not self._shutdown.is_set():
@@ -72,39 +102,68 @@ class OutlookBridge:
                     result_holder["error"] = e
                 finally:
                     result_event.set()
-        except Exception as e:
-            self._init_error = e
-            self._ready.set()  # Unblock the caller so they see the error
-            logger.error("COM thread init failed: %s", e)
+
+            self._drain_pending("COM bridge is shutting down")
         finally:
             pythoncom.CoUninitialize()
 
-    async def call(self, func, *args, **kwargs):
-        """
-        Schedule a function to run on the COM thread and await its result.
+    def _drain_pending(self, message: str):
+        """Reject any queued-but-not-started requests with a clear error."""
+        while True:
+            try:
+                _, _, _, result_event, result_holder = (
+                    self._request_queue.get_nowait()
+                )
+            except queue.Empty:
+                return
+            result_holder["error"] = RuntimeError(message)
+            result_event.set()
 
-        The function signature must be: func(outlook, namespace, *args, **kwargs)
+    async def call(self, func, *args, timeout: float | None = None, **kwargs):
         """
-        result_event = threading.Event()
-        result_holder = {}
-        self._request_queue.put((func, args, kwargs, result_event, result_holder))
+        Schedule a function on the COM thread and await its result.
 
-        loop = asyncio.get_running_loop()
-        signaled = await loop.run_in_executor(
-            None, lambda: result_event.wait(timeout=60)
-        )
-        if not signaled:
-            raise TimeoutError(
-                "Outlook COM operation timed out after 60 seconds. "
-                "Outlook may be waiting for user input (e.g., a dialog box)."
+        Refuses to queue if another call is already in flight: the STA thread
+        can only run one COM call at a time and slow operations should not
+        silently stack up. The caller should retry after a short delay.
+
+        ``timeout`` defaults to ``DEFAULT_CALL_TIMEOUT`` (60s). On timeout the
+        in-flight call continues running on the COM thread until Outlook
+        finishes; the bridge will reject new submissions until then.
+        """
+        timeout_val = DEFAULT_CALL_TIMEOUT if timeout is None else float(timeout)
+        label = getattr(func, "__name__", "<anonymous>")
+
+        if not self._in_flight_lock.acquire(blocking=False):
+            raise ComBridgeBusyError(
+                f"COM thread is busy with previous request "
+                f"({self._in_flight_label or 'unknown'}). Retry shortly."
             )
+        try:
+            self._in_flight_label = label
+            result_event = threading.Event()
+            result_holder: dict = {}
+            self._request_queue.put((func, args, kwargs, result_event, result_holder))
 
-        if "error" in result_holder:
-            raise result_holder["error"]
-        return result_holder.get("value")
+            loop = asyncio.get_running_loop()
+            signaled = await loop.run_in_executor(
+                None, lambda: result_event.wait(timeout=timeout_val)
+            )
+            if not signaled:
+                raise ComBridgeTimeoutError(
+                    f"Outlook COM operation '{label}' timed out after "
+                    f"{timeout_val:.0f}s. Outlook may be waiting on a dialog."
+                )
+            if "error" in result_holder:
+                raise result_holder["error"]
+            return result_holder.get("value")
+        finally:
+            self._in_flight_label = None
+            self._in_flight_lock.release()
 
     def stop(self):
-        """Signal the COM thread to shut down."""
+        """Signal the COM thread to shut down and reject pending requests."""
         self._shutdown.set()
+        self._drain_pending("OutlookBridge stopped")
         if self._thread:
             self._thread.join(timeout=5)
