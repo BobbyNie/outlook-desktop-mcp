@@ -17,6 +17,13 @@ from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
+from outlook_desktop_mcp.utils.contact_helpers import (
+    clamp_contact_count,
+    normalize_search_query,
+    should_cache_contact_result,
+    sort_contacts_by_name,
+)
+from outlook_desktop_mcp.utils.contact_mac import parse_mac_contact_records
 from outlook_desktop_mcp.utils.applescript_helpers import (
     escape,
     format_date,
@@ -95,37 +102,8 @@ end try'''
     return _MAC_CONTACTS_PROBE
 
 
-def _parse_mac_contact_records(raw: str, query: str = "", limit: int = 50) -> list[dict]:
-    """Parse DELIM/RECORD_DELIM contact lines from AppleScript."""
-    query_lower = query.lower().strip()
-    results = []
-    for record in raw.split(RECORD_DELIM):
-        record = record.strip()
-        if not record:
-            continue
-        parts = record.split(DELIM)
-        if len(parts) < 3:
-            continue
-        entry_id, full_name, email = (
-            parts[0].strip(),
-            _clean(parts[1]) or "(no name)",
-            _clean(parts[2]),
-        )
-        if query_lower:
-            haystack = f"{full_name} {email}".lower()
-            if query_lower not in haystack:
-                continue
-        results.append({
-            "entry_id": entry_id,
-            "full_name": full_name,
-            "email": email,
-            "company": _clean(parts[3]) if len(parts) > 3 else "",
-            "phone": _clean(parts[4]) if len(parts) > 4 else "",
-            "job_title": _clean(parts[5]) if len(parts) > 5 else "",
-        })
-        if len(results) >= limit:
-            break
-    return results
+_MAC_LIST_SCAN_LIMIT = 500
+_MAC_SEARCH_SCAN_LIMIT = 1000
 
 
 def _mac_fetch_contacts_script(max_scan: int) -> str:
@@ -1722,10 +1700,10 @@ _MAC_CONTACTS_UNAVAILABLE = (
 
 @mcp.tool()
 async def list_contacts(count: int = 50, account: str = "") -> str:
-    """List contacts from Outlook for Mac (when supported by AppleScript).
+    """List local Outlook contacts via AppleScript (when supported).
 
-    Results are cached in memory for 7 days. The account parameter is ignored
-    on macOS (single Outlook profile).
+    Scans up to 500 contacts, sorts by name in Python, returns up to count.
+    Not the Global Address List. Cached 7 days when non-empty. account is ignored.
 
     Args:
         count: Maximum contacts to return (1-200). Default 50.
@@ -1734,7 +1712,7 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
     Returns:
         JSON array of contact summaries.
     """
-    count = min(max(1, count), 200)
+    count = clamp_contact_count(count)
     cache_key = contact_cache.make_key(
         "mac:list_contacts", count=count, account=account
     )
@@ -1746,10 +1724,14 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
         return _MAC_CONTACTS_UNAVAILABLE
 
     try:
-        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=500))
-        results = _parse_mac_contact_records(raw, limit=count)
+        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=_MAC_LIST_SCAN_LIMIT))
+        parsed = parse_mac_contact_records(raw, limit=_MAC_LIST_SCAN_LIMIT, clean=_clean)
+        results = sort_contacts_by_name(parsed)[:count]
         result = json.dumps(results, indent=2, default=str)
-        contact_cache.set(cache_key, result)
+        if should_cache_contact_result(
+            result, tool="mac:list_contacts", allow_empty_list=False
+        ):
+            contact_cache.set(cache_key, result)
         return result
     except Exception as e:
         return f"Error listing contacts: {e}"
@@ -1761,21 +1743,25 @@ async def search_contacts(
     count: int = 20,
     account: str = "",
 ) -> str:
-    """Search Outlook contacts by name or email (macOS AppleScript).
+    """Search local Outlook contacts by name or email (macOS AppleScript).
 
-    Results are cached in memory for 7 days per query.
+    Scans up to 1000 contacts; may miss matches beyond that scan window.
+    Cached 7 days only when matches are found.
 
     Args:
-        query: Search term (case-insensitive substring).
+        query: Search term (case-insensitive substring). Must not be empty.
         count: Maximum results (1-200). Default 20.
         account: Ignored on macOS.
 
     Returns:
         JSON array of matching contact summaries.
     """
-    count = min(max(1, count), 200)
+    normalized = normalize_search_query(query)
+    if normalized is None:
+        return "Error: query must not be empty"
+    count = clamp_contact_count(count)
     cache_key = contact_cache.make_key(
-        "mac:search_contacts", query=query, count=count, account=account
+        "mac:search_contacts", query=normalized, count=count, account=account
     )
     cached = contact_cache.get(cache_key)
     if cached is not None:
@@ -1785,10 +1771,21 @@ async def search_contacts(
         return _MAC_CONTACTS_UNAVAILABLE
 
     try:
-        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=1000))
-        results = _parse_mac_contact_records(raw, query=query, limit=count)
+        raw = await bridge.run(
+            _mac_fetch_contacts_script(max_scan=_MAC_SEARCH_SCAN_LIMIT)
+        )
+        matches = parse_mac_contact_records(
+            raw,
+            query=normalized,
+            limit=_MAC_SEARCH_SCAN_LIMIT,
+            clean=_clean,
+        )
+        results = sort_contacts_by_name(matches)[:count]
         result = json.dumps(results, indent=2, default=str)
-        contact_cache.set(cache_key, result)
+        if should_cache_contact_result(
+            result, tool="mac:search_contacts", allow_empty_list=False
+        ):
+            contact_cache.set(cache_key, result)
         return result
     except Exception as e:
         return f"Error searching contacts: {e}"
@@ -1798,18 +1795,21 @@ async def search_contacts(
 async def resolve_recipient(name: str, account: str = "") -> str:
     """Resolve a name to an email using the local Outlook contact list (macOS).
 
-    Searches cached-eligible contact data from AppleScript. For Global Address
-    List resolution, use Windows COM or resolve manually.
+    Scans up to 1000 local contacts; does not use GAL. Only successful
+    resolutions are cached.
 
     Args:
-        name: Display name or email fragment to match.
+        name: Display name or email fragment to match. Must not be empty.
         account: Ignored on macOS.
 
     Returns:
         JSON object with resolved, name, and email fields.
     """
+    normalized_name = name.strip()
+    if not normalized_name:
+        return "Error: name must not be empty"
     cache_key = contact_cache.make_key(
-        "mac:resolve_recipient", name=name, account=account
+        "mac:resolve_recipient", name=normalized_name, account=account
     )
     cached = contact_cache.get(cache_key)
     if cached is not None:
@@ -1819,25 +1819,31 @@ async def resolve_recipient(name: str, account: str = "") -> str:
         return _MAC_CONTACTS_UNAVAILABLE
 
     try:
-        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=1000))
-        matches = _parse_mac_contact_records(raw, query=name, limit=5)
+        raw = await bridge.run(
+            _mac_fetch_contacts_script(max_scan=_MAC_SEARCH_SCAN_LIMIT)
+        )
+        matches = sort_contacts_by_name(
+            parse_mac_contact_records(
+                raw, query=normalized_name, limit=5, clean=_clean
+            )
+        )
         if not matches:
-            result = json.dumps({
+            return json.dumps({
                 "resolved": False,
-                "name": name,
+                "name": normalized_name,
                 "email": "",
                 "address_type": "mac_contact",
                 "message": "Could not resolve recipient in local contacts",
             }, indent=2)
-        else:
-            best = matches[0]
-            result = json.dumps({
-                "resolved": True,
-                "name": best["full_name"],
-                "email": best["email"],
-                "address_type": "mac_contact",
-            }, indent=2)
-        contact_cache.set(cache_key, result)
+        best = matches[0]
+        result = json.dumps({
+            "resolved": True,
+            "name": best["full_name"],
+            "email": best["email"],
+            "address_type": "mac_contact",
+        }, indent=2)
+        if should_cache_contact_result(result, tool="mac:resolve_recipient"):
+            contact_cache.set(cache_key, result)
         return result
     except Exception as e:
         return f"Error resolving recipient: {e}"

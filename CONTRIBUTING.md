@@ -64,7 +64,7 @@ pytest tests/contacts_mcp_test.py -v
 python tests\phase3_mcp_test.py
 ```
 
-Contact tools are cached in memory for 7 days; restart the MCP server to refresh after editing contacts in Outlook.
+Contact tools cache successful results for 7 days (max 256 entries, LRU). Failed `resolve_recipient` and empty macOS lists are not cached. Restart the MCP server to refresh after editing contacts in Outlook.
 
 ## Adding New Tools
 

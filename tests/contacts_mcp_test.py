@@ -49,6 +49,11 @@ async def test_contacts_tools_discovery_and_cache(stdio_server_params):
             content2 = result2.content[0].text
             assert content1 == content2
 
+            empty_search = await session.call_tool(
+                "search_contacts", {"query": "   ", "count": 5}
+            )
+            assert empty_search.content[0].text.startswith("Error:")
+
             if contacts:
                 query = contacts[0].get("full_name", "")[:3]
                 if query:
@@ -59,3 +64,17 @@ async def test_contacts_tools_discovery_and_cache(stdio_server_params):
                         "search_contacts", {"query": query, "count": 5}
                     )
                     assert search1.content[0].text == search2.content[0].text
+
+            user_name = contacts[0].get("full_name") if contacts else None
+            if user_name:
+                r1 = await session.call_tool(
+                    "resolve_recipient", {"name": user_name}
+                )
+                r2 = await session.call_tool(
+                    "resolve_recipient", {"name": user_name}
+                )
+                text = r1.content[0].text
+                assert r1.content[0].text == r2.content[0].text
+                data = json.loads(text)
+                if data.get("resolved"):
+                    assert data.get("email")

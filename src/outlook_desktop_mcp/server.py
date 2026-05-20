@@ -49,6 +49,11 @@ from outlook_desktop_mcp.utils.formatting import (
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
+from outlook_desktop_mcp.utils.contact_helpers import (
+    clamp_contact_count,
+    normalize_search_query,
+    should_cache_contact_result,
+)
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -109,8 +114,8 @@ mcp = FastMCP(
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts\n"
-        "- Contacts: search and list address book entries, resolve names to email "
-        "(results cached in memory for 7 days)"
+        "- Contacts: list/search Contacts folder, resolve names (GAL on Windows); "
+        "7-day in-memory cache (256 entries max, failures not cached)"
     ),
 )
 
@@ -1792,10 +1797,10 @@ def _iter_contact_items(items, limit: int):
 
 @mcp.tool()
 async def list_contacts(count: int = 50, account: str = "") -> str:
-    """List contacts from the Outlook address book (Contacts folder).
+    """List contacts from the Outlook Contacts folder (not the full GAL).
 
-    Returns contacts sorted by full name. Results are cached in memory for
-    7 days; restart the MCP server to force a refresh.
+    Returns contacts sorted by full name (A–Z). Results are cached in memory
+    for 7 days (up to 256 distinct queries); restart the MCP server to refresh.
 
     Args:
         count: Maximum contacts to return (1-200). Default 50.
@@ -1805,17 +1810,17 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
     Returns:
         JSON array of contact summaries.
     """
+    count = clamp_contact_count(count)
     cache_key = contact_cache.make_key("list_contacts", count=count, account=account)
     cached = contact_cache.get(cache_key)
     if cached is not None:
         return cached
 
     def _list(outlook, namespace, count, account):
-        count = min(max(1, count), 200)
         store = _require_store(namespace, account)
         folder = _get_contacts_folder(store)
         items = folder.Items
-        items.Sort("[FullName]", True)
+        items.Sort("[FullName]", False)
         results = []
         for item in _iter_contact_items(items, count):
             results.append(format_contact_summary(item))
@@ -1823,7 +1828,7 @@ async def list_contacts(count: int = 50, account: str = "") -> str:
 
     try:
         result = await bridge.call(_list, count, account)
-        if not result.startswith("Error"):
+        if should_cache_contact_result(result, tool="list_contacts"):
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:
@@ -1836,28 +1841,32 @@ async def search_contacts(
     count: int = 20,
     account: str = "",
 ) -> str:
-    """Search the Outlook address book by name or email.
+    """Search the Outlook Contacts folder by name or email (not full GAL).
 
-    Matches full name and primary/secondary email fields. Results are cached
-    in memory for 7 days per unique query; restart the MCP server to refresh.
+    Matches full name and email fields in the Contacts folder only. Use
+    resolve_recipient for Global Address List name resolution on Windows.
+    Results are cached for 7 days per unique query.
 
     Args:
-        query: Search term (case-insensitive substring).
+        query: Search term (case-insensitive substring). Must not be empty.
         count: Maximum results (1-200). Default 20.
         account: Optional. Account display name (or substring).
 
     Returns:
         JSON array of matching contact summaries.
     """
+    normalized = normalize_search_query(query)
+    if normalized is None:
+        return "Error: query must not be empty"
+    count = clamp_contact_count(count)
     cache_key = contact_cache.make_key(
-        "search_contacts", query=query, count=count, account=account
+        "search_contacts", query=normalized, count=count, account=account
     )
     cached = contact_cache.get(cache_key)
     if cached is not None:
         return cached
 
     def _search(outlook, namespace, query, count, account):
-        count = min(max(1, count), 200)
         store = _require_store(namespace, account)
         folder = _get_contacts_folder(store)
         safe = _safe_dasl(query)
@@ -1868,15 +1877,15 @@ async def search_contacts(
             f"([Email3Address] LIKE '%{safe}%')"
         )
         items = folder.Items.Restrict(filter_str)
-        items.Sort("[FullName]", True)
+        items.Sort("[FullName]", False)
         results = []
         for item in _iter_contact_items(items, count):
             results.append(format_contact_summary(item))
         return json.dumps(results, indent=2, default=str)
 
     try:
-        result = await bridge.call(_search, query, count, account)
-        if not result.startswith("Error"):
+        result = await bridge.call(_search, normalized, count, account)
+        if should_cache_contact_result(result, tool="search_contacts"):
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:
@@ -1887,18 +1896,24 @@ async def search_contacts(
 async def resolve_recipient(name: str, account: str = "") -> str:
     """Resolve a display name or alias to an email address.
 
-    Uses Outlook's address resolution (including Global Address List when
-    available). Results are cached in memory for 7 days.
+    Uses Outlook CreateRecipient/Resolve (includes Global Address List when
+    available). Only successful resolutions are cached (7 days).
 
     Args:
         name: Display name, alias, or partial email to resolve.
             Examples: "Jane Doe", "jdoe", "jane@contoso.com".
-        account: Optional. Account context (reserved for multi-store profiles).
+        account: Optional. Validates account exists; resolution uses default
+            Outlook session (not store-specific).
 
     Returns:
         JSON object with resolved, name, email, and address_type fields.
     """
-    cache_key = contact_cache.make_key("resolve_recipient", name=name, account=account)
+    normalized_name = name.strip()
+    if not normalized_name:
+        return "Error: name must not be empty"
+    cache_key = contact_cache.make_key(
+        "resolve_recipient", name=normalized_name, account=account
+    )
     cached = contact_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1924,8 +1939,8 @@ async def resolve_recipient(name: str, account: str = "") -> str:
         }, indent=2, default=str)
 
     try:
-        result = await bridge.call(_resolve, name, account)
-        if not result.startswith("Error"):
+        result = await bridge.call(_resolve, normalized_name, account)
+        if should_cache_contact_result(result, tool="resolve_recipient"):
             contact_cache.set(cache_key, result)
         return result
     except Exception as e:

@@ -55,3 +55,16 @@ def test_clear_removes_all():
     cache.clear()
     assert cache.get(key) is None
     assert len(cache) == 0
+
+
+def test_lru_evicts_oldest_when_over_max_entries():
+    cache = ContactCache(ttl_seconds=3600, max_entries=2)
+    k1 = cache.make_key("a", x=1)
+    k2 = cache.make_key("a", x=2)
+    k3 = cache.make_key("a", x=3)
+    cache.set(k1, "one")
+    cache.set(k2, "two")
+    cache.set(k3, "three")
+    assert cache.get(k1) is None
+    assert cache.get(k2) == "two"
+    assert cache.get(k3) == "three"

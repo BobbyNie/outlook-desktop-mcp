@@ -155,15 +155,15 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 ### Contacts (address book)
 
-Contact query results are cached **in memory for 7 days** per unique query. Restart the MCP server to force a refresh after contact changes.
-
 | Tool | Windows | macOS | Description |
 |------|:-------:|:-----:|-------------|
-| `list_contacts` | yes | yes* | List contacts from the address book, sorted by name |
-| `search_contacts` | yes | yes* | Search contacts by name or email |
-| `resolve_recipient` | yes | yes* | Resolve a display name or alias to an email (GAL on Windows) |
+| `list_contacts` | yes | yes* | List items from the **Contacts folder** (sorted A–Z) |
+| `search_contacts` | yes | yes* | Search **Contacts folder** by name/email (not full GAL) |
+| `resolve_recipient` | yes | yes* | Resolve a name to email; **Windows uses GAL** via COM |
 
-\*macOS depends on Outlook's AppleScript `contacts` collection; if unavailable, tools return a clear error.
+**Caching:** Successful results are cached in memory for **7 days** (max **256** entries, LRU eviction). Failed resolutions and empty macOS results are not cached. Restart the MCP server to refresh after editing contacts.
+
+\*macOS: AppleScript `contacts` only; scans up to **500** (list) or **1000** (search/resolve) local contacts. No GAL. If AppleScript contacts are unavailable, tools return a clear error.
 
 ### Categories, Rules, Out of Office (Windows only)
 
