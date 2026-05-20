@@ -32,7 +32,7 @@ def escape(text: str) -> str:
 # Entry ID validation (defense against AppleScript injection)
 # ---------------------------------------------------------------------------
 
-_MAC_ENTRY_ID_RE = re.compile(r"^\d{1,32}$")
+_MAC_ENTRY_ID_RE = re.compile(r"\A\d{1,32}\Z")
 
 
 class InvalidEntryIdError(ValueError):
@@ -43,8 +43,9 @@ def validate_mac_entry_id(entry_id) -> str:
     """Return a sanitized macOS Outlook entry_id (numeric only).
 
     macOS Outlook entry IDs are numeric AppleScript object IDs. Any other
-    characters are rejected to prevent AppleScript injection through string
-    interpolation.
+    characters — including embedded newlines, surrounding whitespace beyond a
+    simple strip, or punctuation — are rejected to prevent AppleScript
+    injection through string interpolation.
     """
     s = str(entry_id).strip()
     if not _MAC_ENTRY_ID_RE.match(s):

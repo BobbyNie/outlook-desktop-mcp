@@ -10,7 +10,6 @@ Entry point: python -m outlook_desktop_mcp.server
 import sys
 import json
 import logging
-import re
 
 from mcp.server.fastmcp import FastMCP
 
@@ -190,13 +189,22 @@ def _require_store(namespace, account: str = ""):
 
 
 def _resolve_account_object(outlook, store):
-    """Return the Outlook ``Account`` object whose DeliveryStore matches ``store``."""
+    """Return the Outlook ``Account`` object whose DeliveryStore matches ``store``.
+
+    Per-account ``DeliveryStore`` access can raise (e.g. POP3 accounts without
+    a delivery store); skip those individually instead of aborting the whole
+    scan, which would mask a later matching account.
+    """
     try:
-        for acc in outlook.Session.Accounts:
+        accounts = outlook.Session.Accounts
+    except Exception:
+        return None
+    for acc in accounts:
+        try:
             if acc.DeliveryStore.StoreID == store.StoreID:
                 return acc
-    except Exception:
-        pass
+        except Exception:
+            continue
     return None
 
 
@@ -540,11 +548,7 @@ async def mark_as_read(entry_id: str, account: str = "") -> str:
         Confirmation message with the email subject, or an error.
     """
     def _mark(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -579,11 +583,7 @@ async def mark_as_unread(entry_id: str, account: str = "") -> str:
         Confirmation message with the email subject, or an error.
     """
     def _mark(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_MAIL, "mail item"):
             return err
         subject = item.Subject
@@ -1213,11 +1213,7 @@ async def update_event(
         Confirmation with updated event details, or an error.
     """
     def _update(outlook, namespace, entry_id, subject, start, end, location, body, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_APPOINTMENT, "appointment/meeting item"):
             return err
         if subject:
@@ -1591,11 +1587,7 @@ async def complete_task(entry_id: str, account: str = "") -> str:
         Confirmation with the task subject.
     """
     def _complete(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
         item.Status = OL_TASK_COMPLETE
@@ -1622,11 +1614,7 @@ async def delete_task(entry_id: str, account: str = "") -> str:
         Confirmation with the task subject.
     """
     def _delete(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if err := _check_item_class(item, _OL_CLASS_TASK, "task item"):
             return err
         subject = item.Subject
@@ -1656,11 +1644,7 @@ async def list_attachments(entry_id: str, account: str = "") -> str:
         JSON array of attachment objects with index, filename, and size.
     """
     def _list(outlook, namespace, entry_id, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         results = []
         for i in range(item.Attachments.Count):
             att = item.Attachments.Item(i + 1)
@@ -1706,11 +1690,7 @@ async def save_attachment(
         return f"Error: {e}"
 
     def _save(outlook, namespace, entry_id, attachment_index, save_dir, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         if attachment_index < 1 or item.Attachments.Count < attachment_index:
             return f"Error: Only {item.Attachments.Count} attachment(s), requested index {attachment_index}"
 
@@ -1791,11 +1771,7 @@ async def set_category(
         Confirmation with the item subject and applied categories.
     """
     def _set(outlook, namespace, entry_id, categories, account):
-        if account:
-            store = _require_store(namespace, account)
-            item = namespace.GetItemFromID(entry_id, store.StoreID)
-        else:
-            item = namespace.GetItemFromID(entry_id)
+        item = _get_item_for_account(namespace, entry_id, account)
         item.Categories = categories
         item.Save()
         return (

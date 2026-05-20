@@ -123,13 +123,18 @@ class OutlookBridge:
         """
         Schedule a function on the COM thread and await its result.
 
-        Refuses to queue if another call is already in flight: the STA thread
-        can only run one COM call at a time and slow operations should not
-        silently stack up. The caller should retry after a short delay.
+        Refuses to queue if another call is currently *awaited* by the caller
+        path: the STA thread can only run one COM call at a time and slow
+        operations should not silently stack up. The caller should retry after
+        a short delay.
 
-        ``timeout`` defaults to ``DEFAULT_CALL_TIMEOUT`` (60s). On timeout the
-        in-flight call continues running on the COM thread until Outlook
-        finishes; the bridge will reject new submissions until then.
+        Note that on ``ComBridgeTimeoutError`` the in-flight COM call keeps
+        running on the COM thread (COM has no cancellation). The bridge lock
+        is released when the caller's ``call`` returns, so subsequent calls
+        will queue behind the still-running operation; if you need hard
+        back-pressure, catch the timeout and refuse new work yourself.
+
+        ``timeout`` defaults to ``DEFAULT_CALL_TIMEOUT`` (60s).
         """
         timeout_val = DEFAULT_CALL_TIMEOUT if timeout is None else float(timeout)
         label = getattr(func, "__name__", "<anonymous>")
