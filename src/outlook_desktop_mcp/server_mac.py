@@ -32,6 +32,10 @@ from outlook_desktop_mcp.utils.attachment_safety import (
     resolve_attachment_path,
     sanitize_attachment_filename,
 )
+from outlook_desktop_mcp.utils.draft_html import (
+    InvalidInlineImage,
+    prepare_inline_html,
+)
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
@@ -74,7 +78,11 @@ mcp = FastMCP(
         "- Tasks: create, list, complete, delete to-do items\n"
         "- Attachments: list and save attachments\n"
         "- Folders: list folder hierarchy\n"
-        "- Contacts: search and list address book (cached 7 days; limited AppleScript support)"
+        "- Contacts: search and list address book (cached 7 days; limited AppleScript support)\n"
+        "- Drafts: list/get/create/update/send/delete drafts. HTML body is "
+        "supported via 'html content'. Inline images are added as ordinary "
+        "attachments — Outlook for Mac AppleScript cannot reliably set the "
+        "Content-ID required for true inline display."
     ),
 )
 
@@ -1964,6 +1972,419 @@ async def resolve_recipient(name: str, account: str = "") -> str:
         return result
     except Exception as e:
         return f"Error resolving recipient: {e}"
+
+
+# =====================================================================
+# DRAFT EMAIL TOOLS (macOS)
+# =====================================================================
+#
+# Outlook for Mac AppleScript exposes ``drafts`` as a folder of ``message``
+# objects and uses ``outgoing message`` objects for unsent items. There is
+# no reliable AppleScript hook to set per-attachment Content-IDs, so inline
+# images are added as ordinary attachments; clients see them as attachments,
+# not as inline-rendered images. The HTML body itself is set via ``html
+# content`` and will be rendered by the recipient's mail client.
+
+
+def _build_recipient_lines(addresses: str, kind: str) -> str:
+    lines = ""
+    for addr in (addresses or "").split(";"):
+        addr = addr.strip()
+        if addr:
+            lines += (
+                f'make new {kind} at newMsg with properties '
+                f'{{email address:{{address:"{escape(addr)}"}}}}\n'
+            )
+    return lines
+
+
+def _build_attachment_lines(paths: list | None) -> str:
+    lines = ""
+    if not paths:
+        return lines
+    for entry in paths:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError("attachments must be a list of file path strings")
+        if entry.startswith("\\\\") or entry.startswith("//"):
+            raise ValueError(f"UNC paths not allowed for attachment: {entry!r}")
+        abs_path = os.path.abspath(os.path.expanduser(entry))
+        if not os.path.isfile(abs_path):
+            raise ValueError(f"attachment file does not exist: {entry!r}")
+        lines += (
+            f'make new attachment at newMsg with properties '
+            f'{{file:POSIX file "{escape(abs_path)}"}}\n'
+        )
+    return lines
+
+
+@mcp.tool()
+async def list_drafts(count: int = 20, account: str = "") -> str:
+    """List unsent drafts from Outlook for Mac's Drafts folder.
+
+    Returns a JSON array sorted by last-modified time, newest first.
+
+    Args:
+        count: Maximum drafts to return (1-200). Default 20.
+        account: Ignored on macOS (single Outlook profile).
+    """
+    count = min(max(1, int(count) if isinstance(count, int) else 20), 200)
+    script = f'''tell application "Microsoft Outlook"
+    set draftFolder to drafts
+    set msgs to messages of draftFolder
+    set total to count of msgs
+    set maxCount to {count}
+    if total < maxCount then set maxCount to total
+    set output to ""
+    repeat with i from 1 to maxCount
+        set m to item i of msgs
+        set mid to id of m as text
+        set msubject to ""
+        try
+            set msubject to subject of m
+        end try
+        set mto to ""
+        try
+            set recips to to recipients of m
+            repeat with r in recips
+                set mto to mto & address of r & "; "
+            end repeat
+        end try
+        set mtime to ""
+        try
+            set mtime to time received of m as string
+        end try
+        set mattcount to 0
+        try
+            set mattcount to count of attachments of m
+        end try
+        set output to output & mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mtime & "{DELIM}" & (mattcount as text) & "{RECORD_DELIM}"
+    end repeat
+    return output
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        results = []
+        for record in raw.split(RECORD_DELIM):
+            record = record.strip()
+            if not record:
+                continue
+            parts = record.split(DELIM)
+            if len(parts) < 5:
+                continue
+            results.append({
+                "entry_id": parts[0].strip(),
+                "subject": parts[1].strip() or "(no subject)",
+                "to": parts[2].strip(),
+                "last_modified": _clean(parts[3]),
+                "attachment_count": int(parts[4]) if parts[4].strip().isdigit() else 0,
+            })
+        return json.dumps(results, indent=2, default=str)
+    except Exception as e:
+        return f"Error listing drafts: {e}"
+
+
+@mcp.tool()
+async def get_draft(entry_id: str, account: str = "") -> str:
+    """Read full details of a single draft from Outlook for Mac.
+
+    Returns subject, recipients, plain-text body, html_body (if any), and
+    attachment metadata. account is ignored on macOS.
+    """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
+
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    set mid to id of m as text
+    set msubject to ""
+    try
+        set msubject to subject of m
+    end try
+    set mto to ""
+    try
+        set recips to to recipients of m
+        repeat with r in recips
+            set mto to mto & address of r & "; "
+        end repeat
+    end try
+    set mcc to ""
+    try
+        set recips to cc recipients of m
+        repeat with r in recips
+            set mcc to mcc & address of r & "; "
+        end repeat
+    end try
+    set mbody to ""
+    try
+        set mbody to plain text content of m
+    end try
+    set mhtml to ""
+    try
+        set mhtml to content of m
+    end try
+    set attLines to ""
+    try
+        set attList to attachments of m
+        set attCount to count of attList
+        repeat with i from 1 to attCount
+            set a to item i of attList
+            set aname to ""
+            try
+                set aname to name of a
+            end try
+            set asize to 0
+            try
+                set asize to file size of a
+            end try
+            set attLines to attLines & (i as text) & "{DELIM}" & aname & "{DELIM}" & (asize as text) & "{RECORD_DELIM}"
+        end repeat
+    end try
+    return mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody & "{DELIM}" & mhtml & "{DELIM}{DELIM}" & attLines
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        head, _, attbuf = raw.partition(f"{DELIM}{DELIM}")
+        parts = head.split(DELIM, 5)
+        if len(parts) < 6:
+            return json.dumps({"error": "Failed to parse draft data"})
+
+        attachments = []
+        for record in (attbuf or "").split(RECORD_DELIM):
+            record = record.strip()
+            if not record:
+                continue
+            ap = record.split(DELIM)
+            if len(ap) < 3:
+                continue
+            attachments.append({
+                "index": int(ap[0]) if ap[0].strip().isdigit() else 0,
+                "filename": ap[1].strip(),
+                "size": int(ap[2]) if ap[2].strip().isdigit() else 0,
+            })
+
+        result = {
+            "entry_id": parts[0].strip(),
+            "subject": parts[1].strip() or "(no subject)",
+            "to": parts[2].strip(),
+            "cc": parts[3].strip(),
+            "body": _truncate(_clean(parts[4])),
+            "html_body": _clean(parts[5]),
+            "attachments": attachments,
+        }
+        return json.dumps(result, indent=2, default=str)
+    except Exception as e:
+        return f"Error reading draft: {e}"
+
+
+@mcp.tool()
+async def create_draft(
+    to: str,
+    subject: str,
+    body: str = "",
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    inline_images: list | None = None,
+    attachments: list | None = None,
+    account: str = "",
+) -> str:
+    """Create an unsent draft message in Outlook for Mac.
+
+    Supports HTML body. Inline images are saved as ordinary attachments
+    (Outlook for Mac AppleScript cannot reliably set per-attachment Content-IDs
+    needed for true inline display); recipients will see them as separate
+    attachments rather than embedded in the body.
+
+    Args mirror the Windows create_draft. account is ignored on macOS.
+
+    Returns:
+        JSON object describing the saved draft.
+    """
+    try:
+        final_html, cid_pairs = prepare_inline_html(body, html_body, inline_images)
+    except InvalidInlineImage as e:
+        return f"Error: {e}"
+
+    image_paths = [path for _, path in cid_pairs]
+
+    try:
+        attachment_lines = _build_attachment_lines(image_paths) + _build_attachment_lines(attachments)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    to_lines = _build_recipient_lines(to, "to recipient")
+    cc_lines = _build_recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _build_recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+    if html_body or inline_images:
+        body_props = (
+            f'subject:"{escape(subject)}", content:"{escape(body or "")}", '
+            f'html content:"{escape(final_html)}"'
+        )
+    else:
+        body_props = f'subject:"{escape(subject)}", content:"{escape(body or "")}"'
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{{body_props}}}
+    {to_lines}{cc_lines}{bcc_lines}{attachment_lines}
+    save newMsg
+    return id of newMsg as text
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        return json.dumps({
+            "status": "created",
+            "entry_id": raw.strip(),
+            "subject": subject,
+            "to": to,
+            "inline_images_attached_as_files": len(image_paths),
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error creating draft: {e}"
+
+
+@mcp.tool()
+async def update_draft(
+    entry_id: str,
+    to: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html_body: str | None = None,
+    inline_images: list | None = None,
+    attachments: list | None = None,
+    replace_attachments: bool = False,
+    account: str = "",
+) -> str:
+    """Update an existing macOS draft. Unsupplied fields are unchanged.
+
+    Note: on Outlook for Mac AppleScript, ``replace_attachments=True`` and
+    bulk attachment edits may be partially supported depending on the
+    installed version. account is ignored on macOS.
+    """
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
+
+    try:
+        if inline_images is not None or html_body is not None:
+            final_html, cid_pairs = prepare_inline_html(
+                body or "", html_body or "", inline_images
+            )
+        else:
+            final_html, cid_pairs = None, []
+    except InvalidInlineImage as e:
+        return f"Error: {e}"
+
+    set_lines = ""
+    if to is not None:
+        # Rebuild recipients: clear all then add
+        set_lines += 'try\n        delete (to recipients of m)\n    end try\n    '
+        set_lines += _build_recipient_lines(to, "to recipient").replace("newMsg", "m") + "    "
+    if cc is not None:
+        set_lines += 'try\n        delete (cc recipients of m)\n    end try\n    '
+        set_lines += _build_recipient_lines(cc, "cc recipient").replace("newMsg", "m") + "    "
+    if bcc is not None:
+        set_lines += 'try\n        delete (bcc recipients of m)\n    end try\n    '
+        set_lines += _build_recipient_lines(bcc, "bcc recipient").replace("newMsg", "m") + "    "
+    if subject is not None:
+        set_lines += f'set subject of m to "{escape(subject)}"\n    '
+    if body is not None:
+        set_lines += f'set content of m to "{escape(body)}"\n    '
+    if final_html is not None:
+        set_lines += f'set html content of m to "{escape(final_html)}"\n    '
+
+    image_paths = [p for _, p in cid_pairs]
+    try:
+        att_lines_combined = (
+            _build_attachment_lines(image_paths).replace("newMsg", "m")
+            + _build_attachment_lines(attachments).replace("newMsg", "m")
+        )
+    except ValueError as e:
+        return f"Error: {e}"
+
+    replace_block = ""
+    if replace_attachments:
+        replace_block = "try\n        delete (attachments of m)\n    end try\n    "
+
+    if not (set_lines or att_lines_combined or replace_attachments):
+        return json.dumps({"error": "No fields to update"})
+
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    {replace_block}{set_lines}{att_lines_combined}
+    save m
+    return id of m as text
+end tell'''
+
+    try:
+        raw = await bridge.run(script)
+        return json.dumps({
+            "status": "updated",
+            "entry_id": raw.strip() or entry_id,
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error updating draft: {e}"
+
+
+@mcp.tool()
+async def send_draft(entry_id: str, account: str = "") -> str:
+    """Send a previously saved macOS draft. account is ignored on macOS."""
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
+
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    set s to ""
+    try
+        set s to subject of m
+    end try
+    send m
+    return s
+end tell'''
+
+    try:
+        subject = await bridge.run(script)
+        return json.dumps({
+            "status": "sent",
+            "subject": subject.strip() or "(no subject)",
+        }, indent=2, default=str)
+    except Exception as e:
+        return f"Error sending draft: {e}"
+
+
+@mcp.tool()
+async def delete_draft(entry_id: str, account: str = "") -> str:
+    """Permanently delete a macOS draft. account is ignored on macOS."""
+    try:
+        entry_id = validate_mac_entry_id(entry_id)
+    except InvalidEntryIdError as e:
+        return f"Error: {e}"
+
+    script = f'''tell application "Microsoft Outlook"
+    set m to message id {entry_id}
+    set s to ""
+    try
+        set s to subject of m
+    end try
+    delete m
+    return s
+end tell'''
+
+    try:
+        subject = await bridge.run(script)
+        return f"Draft deleted: '{subject.strip() or '(no subject)'}'"
+    except Exception as e:
+        return f"Error deleting draft: {e}"
 
 
 # =====================================================================

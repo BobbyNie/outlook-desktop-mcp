@@ -153,6 +153,26 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_attachments` | yes | yes | List all attachments on an email or calendar event |
 | `save_attachment` | yes | yes | Download an attachment to a local directory |
 
+### Drafts (rich text + inline images)
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_drafts` | yes | yes | List unsent drafts, sorted by last modified |
+| `get_draft` | yes | yes | Read a draft including HTML body and attachment metadata |
+| `create_draft` | yes | yes* | Save a new draft with optional HTML body and inline images |
+| `update_draft` | yes | yes* | Edit fields, body, or attachments on an existing draft |
+| `send_draft` | yes | yes | Send a previously saved draft |
+| `delete_draft` | yes | yes | Permanently delete a draft |
+
+`create_draft` / `update_draft` accept:
+
+- `body` (plain text, always saved as fallback)
+- `html_body` (rich HTML — supports formatting, tables, links, etc.)
+- `inline_images`: list of file paths or `{"path": "/abs/x.png", "cid": "logo1", "placeholder": "{{LOGO}}"}` dicts. The HTML may reference them via `<img src="cid:logo1">` or `{{LOGO}}` placeholders. Unreferenced images are appended at the end of the body.
+- `attachments`: list of file paths for ordinary (non-inline) attachments.
+
+\*On Outlook for Mac, inline images are added as ordinary attachments — AppleScript cannot reliably set the per-attachment Content-ID required for true inline rendering. Recipients will see them as separate attachments.
+
 ### Contacts (address book)
 
 | Tool | Windows | macOS | Description |
@@ -177,7 +197,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 33 tools on Windows, 25 tools on macOS** (including `list_accounts` on Windows).
+**Total: 39 tools on Windows, 31 tools on macOS** (including 6 new draft tools on each platform).
 
 ## Architecture Details
 

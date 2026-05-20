@@ -1,6 +1,6 @@
 [project]
 name = "outlook-desktop-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Outlook Desktop as an MCP server — Windows (COM) and macOS (AppleScript). No Graph API, no Entra app registration — just your local Outlook."
 readme = "README.md"
 license = { text = "AGPL-3.0-only" }

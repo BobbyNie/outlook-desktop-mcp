@@ -24,6 +24,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
     OL_FOLDER_CONTACTS,
+    OL_FOLDER_DRAFTS,
     OL_FOLDER_TASKS,
     OL_MEETING,
     OL_MEETING_CANCELED,
@@ -50,6 +51,11 @@ from outlook_desktop_mcp.utils.attachment_safety import (
     UnsafeAttachmentPath,
     ensure_save_directory,
     resolve_attachment_path,
+)
+from outlook_desktop_mcp.utils.draft_html import (
+    InvalidInlineImage,
+    prepare_inline_html,
+    suggest_attachment_basename,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
 from outlook_desktop_mcp.utils.dasl import dasl_date_literal
@@ -130,7 +136,9 @@ mcp = FastMCP(
         "- Out of Office: check auto-reply status\n"
         "- Folders: list folder hierarchy with item counts\n"
         "- Contacts: list/search Contacts folder, resolve names (GAL on Windows); "
-        "7-day in-memory cache (256 entries max, failures not cached)"
+        "7-day in-memory cache (256 entries max, failures not cached)\n"
+        "- Drafts: list/get/create/update/send/delete drafts with optional HTML "
+        "body and inline images (embedded via cid: references)"
     ),
 )
 
@@ -2039,6 +2047,402 @@ async def resolve_recipient(name: str, account: str = "") -> str:
         return result
     except Exception as e:
         return f"Error resolving recipient: {format_com_error(e)}"
+
+
+# =====================================================================
+# DRAFT EMAIL TOOLS
+# =====================================================================
+
+# Outlook attachment Position=0 hides the attachment from the body footer.
+_OL_ATTACH_BY_VALUE = 1
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+_PR_ATTACH_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+
+
+def _attach_inline_image(mail, abs_path: str, cid: str) -> None:
+    """Attach a file as an inline image with the given Content-ID."""
+    display = suggest_attachment_basename(abs_path)
+    attachment = mail.Attachments.Add(abs_path, _OL_ATTACH_BY_VALUE, 0, display)
+    try:
+        attachment.PropertyAccessor.SetProperty(_PR_ATTACH_CONTENT_ID, cid)
+        attachment.PropertyAccessor.SetProperty(_PR_ATTACH_HIDDEN, True)
+    except Exception as e:
+        logger.warning("Could not set inline-image properties for %s: %s", abs_path, e)
+
+
+def _apply_draft_body(mail, body: str, html_body: str, inline_images) -> None:
+    """Populate a draft mail item with body, HTML body, and inline images.
+
+    HTML wins when supplied. Plain ``body`` is always set as text fallback so
+    clients that ignore HTML still see something. Inline images are added with
+    ``cid:`` references; ``inline_images`` may be paths or dicts (see
+    :func:`utils.draft_html.prepare_inline_html`).
+    """
+    if body:
+        mail.Body = body
+    if html_body or inline_images:
+        final_html, cid_pairs = prepare_inline_html(body, html_body, inline_images)
+        mail.HTMLBody = final_html
+        for cid, abs_path in cid_pairs:
+            _attach_inline_image(mail, abs_path, cid)
+
+
+def _add_regular_attachments(mail, attachments) -> list[str]:
+    """Add file paths as ordinary attachments. Returns the list of basenames added."""
+    added: list[str] = []
+    if not attachments:
+        return added
+    for entry in attachments:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError("attachments must be a list of file path strings")
+        if entry.startswith("\\\\") or entry.startswith("//"):
+            raise ValueError(f"UNC paths not allowed for attachment: {entry!r}")
+        abs_path = os.path.abspath(os.path.expanduser(entry))
+        if not os.path.isfile(abs_path):
+            raise ValueError(f"attachment file does not exist: {entry!r}")
+        mail.Attachments.Add(abs_path, _OL_ATTACH_BY_VALUE, 1, suggest_attachment_basename(abs_path))
+        added.append(os.path.basename(abs_path))
+    return added
+
+
+def _draft_summary(mail) -> dict:
+    return {
+        "entry_id": mail.EntryID,
+        "subject": mail.Subject or "(no subject)",
+        "to": getattr(mail, "To", "") or "",
+        "cc": getattr(mail, "CC", "") or "",
+        "bcc": getattr(mail, "BCC", "") or "",
+        "has_html": bool((getattr(mail, "HTMLBody", "") or "").strip()),
+        "attachment_count": int(mail.Attachments.Count),
+    }
+
+
+@mcp.tool()
+async def list_drafts(count: int = 20, account: str = "") -> str:
+    """List unsent draft emails from the Drafts folder.
+
+    Returns a JSON array sorted by last-modified time (newest first). Each
+    entry has entry_id, subject, to, cc, bcc, attachment_count, has_html.
+
+    Args:
+        count: Maximum drafts to return (1-200). Default 20.
+        account: Optional. Account display name (or substring) to target.
+
+    Returns:
+        JSON array of draft summary objects.
+    """
+    def _list(outlook, namespace, count, account):
+        count = min(max(1, count), 200)
+        store = _require_store(namespace, account)
+        folder = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        items = folder.Items
+        try:
+            items.Sort("[LastModificationTime]", True)
+        except Exception:
+            pass
+        results = []
+        limit = min(count, items.Count)
+        for i in range(limit):
+            try:
+                item = items.Item(i + 1)
+                if item.Class != _OL_CLASS_MAIL:
+                    continue
+                results.append({
+                    "entry_id": item.EntryID,
+                    "subject": item.Subject or "(no subject)",
+                    "to": getattr(item, "To", "") or "",
+                    "cc": getattr(item, "CC", "") or "",
+                    "bcc": getattr(item, "BCC", "") or "",
+                    "has_html": bool((getattr(item, "HTMLBody", "") or "").strip()),
+                    "attachment_count": int(item.Attachments.Count),
+                    "last_modified": str(item.LastModificationTime),
+                })
+            except Exception:
+                continue
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        return await bridge.call(_list, count, account)
+    except Exception as e:
+        return f"Error listing drafts: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def get_draft(entry_id: str, account: str = "") -> str:
+    """Read full details of a single draft email, including HTML body and attachments.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the draft.
+        account: Optional. Account display name (or substring) when needed.
+
+    Returns:
+        JSON object with entry_id, subject, to/cc/bcc, body, html_body, and
+        a list of attachments (filename, size, inline flag, content_id).
+    """
+    def _get(outlook, namespace, entry_id, account):
+        item = _get_item_for_account(namespace, entry_id, account)
+        if err := _check_item_class(item, _OL_CLASS_MAIL, "draft mail item"):
+            return err
+
+        attachments = []
+        for i in range(item.Attachments.Count):
+            att = item.Attachments.Item(i + 1)
+            cid = ""
+            hidden = False
+            try:
+                cid = att.PropertyAccessor.GetProperty(_PR_ATTACH_CONTENT_ID) or ""
+            except Exception:
+                pass
+            try:
+                hidden = bool(att.PropertyAccessor.GetProperty(_PR_ATTACH_HIDDEN))
+            except Exception:
+                pass
+            attachments.append({
+                "index": i + 1,
+                "filename": att.FileName,
+                "size": int(getattr(att, "Size", 0) or 0),
+                "inline": bool(cid) or hidden,
+                "content_id": cid,
+            })
+
+        return json.dumps({
+            "entry_id": item.EntryID,
+            "subject": item.Subject or "(no subject)",
+            "to": getattr(item, "To", "") or "",
+            "cc": getattr(item, "CC", "") or "",
+            "bcc": getattr(item, "BCC", "") or "",
+            "body": item.Body or "",
+            "html_body": getattr(item, "HTMLBody", "") or "",
+            "attachments": attachments,
+            "last_modified": str(item.LastModificationTime),
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_get, entry_id, account)
+    except Exception as e:
+        return f"Error reading draft: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def create_draft(
+    to: str,
+    subject: str,
+    body: str = "",
+    cc: str = "",
+    bcc: str = "",
+    html_body: str = "",
+    inline_images: list | None = None,
+    attachments: list | None = None,
+    account: str = "",
+) -> str:
+    """Create a draft email and save it to the Drafts folder (does NOT send).
+
+    Supports plain text, rich HTML, and inline images (embedded in the body
+    via cid: references). Use send_draft to send it later.
+
+    Args:
+        to: One or more To recipients, separated by semicolons.
+            Example: "alice@example.com; bob@example.com"
+        subject: Subject line.
+        body: Plain-text body. Always saved as text fallback. If html_body is
+            empty and inline_images is empty, this is the rendered body.
+        cc: Optional. CC recipients (semicolon-separated).
+        bcc: Optional. BCC recipients (semicolon-separated).
+        html_body: Optional. HTML body. When set, overrides the rendering of
+            body. Use cid: references to embed inline images from
+            inline_images (e.g. <img src="cid:logo1">).
+        inline_images: Optional list of inline-image entries. Each may be:
+            (a) a file path string — auto-assigned CID, appended to the end of
+                the HTML inside a <p>;
+            (b) a dict like {"path": "/abs/path.png", "cid": "logo1",
+                "placeholder": "{{LOGO}}"} — CID is referenced as cid:logo1
+                and the placeholder (if present in html_body) is replaced
+                with <img src="cid:logo1">.
+            Paths must be local files (no UNC, no missing files).
+        attachments: Optional list of file paths for regular attachments.
+            Same path rules as inline_images.
+        account: Optional. Account display name (or substring) for the draft.
+
+    Returns:
+        JSON object describing the saved draft (entry_id, subject, etc.).
+    """
+    try:
+        # Pre-validate paths without holding the COM thread.
+        prepare_inline_html(body, html_body, inline_images)
+    except InvalidInlineImage as e:
+        return f"Error: {e}"
+
+    def _create(outlook, namespace, to, subject, body, cc, bcc, html_body,
+                inline_images, attachments, account):
+        mail = outlook.CreateItem(OL_MAIL_ITEM)
+        if account:
+            store = _require_store(namespace, account)
+            drafts = store.GetDefaultFolder(OL_FOLDER_DRAFTS)
+            moved = mail.Move(drafts)
+            if moved is not None:
+                mail = moved
+            sender_account = _resolve_account_object(outlook, store)
+            if sender_account is not None:
+                mail._oleobj_.Invoke(*(_PR_SEND_USING_ACCOUNT, 0, 8, 0, sender_account))
+        mail.To = to or ""
+        mail.Subject = subject
+        if cc:
+            mail.CC = cc
+        if bcc:
+            mail.BCC = bcc
+        try:
+            _apply_draft_body(mail, body, html_body, inline_images)
+            _add_regular_attachments(mail, attachments)
+        except (InvalidInlineImage, ValueError) as e:
+            return f"Error: {e}"
+        mail.Save()
+        return json.dumps({"status": "created", **_draft_summary(mail)}, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _create, to, subject, body, cc, bcc, html_body,
+            inline_images, attachments, account,
+        )
+    except Exception as e:
+        return f"Error creating draft: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def update_draft(
+    entry_id: str,
+    to: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html_body: str | None = None,
+    inline_images: list | None = None,
+    attachments: list | None = None,
+    replace_attachments: bool = False,
+    account: str = "",
+) -> str:
+    """Update an existing draft. Any field left at its default (None) is unchanged.
+
+    Use replace_attachments=True to remove existing attachments before adding
+    the new ones; otherwise the new attachments and inline images are added
+    on top of what's already on the draft.
+
+    Args mirror create_draft. inline_images/attachments are added (unless
+    replace_attachments is true). To clear the HTML body, pass html_body="".
+
+    Returns:
+        JSON object describing the updated draft.
+    """
+    if inline_images is not None:
+        try:
+            prepare_inline_html(body or "", html_body or "", inline_images)
+        except InvalidInlineImage as e:
+            return f"Error: {e}"
+
+    def _update(outlook, namespace, entry_id, to, subject, body, cc, bcc,
+                html_body, inline_images, attachments, replace_attachments,
+                account):
+        mail = _get_item_for_account(namespace, entry_id, account)
+        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
+            return err
+        if to is not None:
+            mail.To = to
+        if subject is not None:
+            mail.Subject = subject
+        if cc is not None:
+            mail.CC = cc
+        if bcc is not None:
+            mail.BCC = bcc
+
+        if replace_attachments:
+            while mail.Attachments.Count > 0:
+                try:
+                    mail.Attachments.Remove(1)
+                except Exception:
+                    break
+
+        if body is not None or html_body is not None or inline_images:
+            effective_body = body if body is not None else (mail.Body or "")
+            effective_html = html_body if html_body is not None else (
+                getattr(mail, "HTMLBody", "") or ""
+            )
+            try:
+                _apply_draft_body(
+                    mail, effective_body, effective_html, inline_images
+                )
+            except InvalidInlineImage as e:
+                return f"Error: {e}"
+
+        try:
+            _add_regular_attachments(mail, attachments)
+        except ValueError as e:
+            return f"Error: {e}"
+
+        mail.Save()
+        return json.dumps({"status": "updated", **_draft_summary(mail)}, indent=2, default=str)
+
+    try:
+        return await bridge.call(
+            _update, entry_id, to, subject, body, cc, bcc, html_body,
+            inline_images, attachments, replace_attachments, account,
+        )
+    except Exception as e:
+        return f"Error updating draft: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def send_draft(entry_id: str, account: str = "") -> str:
+    """Send a previously saved draft email.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the draft to send.
+        account: Optional. Account display name (or substring) when needed.
+
+    Returns:
+        Confirmation with the sent subject, or an error.
+    """
+    def _send(outlook, namespace, entry_id, account):
+        mail = _get_item_for_account(namespace, entry_id, account)
+        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
+            return err
+        subject = mail.Subject or "(no subject)"
+        recipients = mail.To or ""
+        mail.Send()
+        return json.dumps({
+            "status": "sent",
+            "subject": subject,
+            "to": recipients,
+        }, indent=2, default=str)
+
+    try:
+        return await bridge.call(_send, entry_id, account)
+    except Exception as e:
+        return f"Error sending draft: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def delete_draft(entry_id: str, account: str = "") -> str:
+    """Permanently delete a draft email.
+
+    Args:
+        entry_id: The unique Outlook EntryID of the draft.
+        account: Optional. Account display name (or substring) when needed.
+
+    Returns:
+        Confirmation with the deleted subject, or an error.
+    """
+    def _delete(outlook, namespace, entry_id, account):
+        mail = _get_item_for_account(namespace, entry_id, account)
+        if err := _check_item_class(mail, _OL_CLASS_MAIL, "draft mail item"):
+            return err
+        subject = mail.Subject or "(no subject)"
+        mail.Delete()
+        return f"Draft deleted: '{subject}'"
+
+    try:
+        return await bridge.call(_delete, entry_id, account)
+    except Exception as e:
+        return f"Error deleting draft: {format_com_error(e)}"
 
 
 # =====================================================================
