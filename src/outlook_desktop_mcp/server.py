@@ -439,9 +439,6 @@ async def list_emails(
             return json.dumps({"error": f"Folder '{folder}' not found"})
 
         items = target.Items
-        items.Sort("[ReceivedTime]", True)
-
-        # Build restriction filters
         restrictions = []
         if unread_only:
             restrictions.append("[UnRead] = True")
@@ -452,11 +449,11 @@ async def list_emails(
             end = _parse_date(end_date)
             restrictions.append(f"[ReceivedTime] <= {dasl_date_literal(end)}")
         elif start_date:
-            # Default end to now when start is specified
             restrictions.append(f"[ReceivedTime] <= {dasl_date_literal(datetime.now())}")
 
         if restrictions:
             items = items.Restrict(" AND ".join(restrictions))
+        items.Sort("[ReceivedTime]", True)
 
         results = []
         limit = min(count, items.Count)
@@ -1474,10 +1471,9 @@ async def list_tasks(
         store = _require_store(namespace, account)
         folder = store.GetDefaultFolder(OL_FOLDER_TASKS)
         items = folder.Items
-        items.Sort("[DueDate]")
-
         if not include_completed:
             items = items.Restrict("[Complete] = False")
+        items.Sort("[DueDate]")
 
         results = []
         limit = min(count, items.Count)
