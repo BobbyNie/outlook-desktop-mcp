@@ -55,6 +55,57 @@ def validate_mac_entry_id(entry_id) -> str:
     return s
 
 
+class InvalidScriptIntError(ValueError):
+    """Raised when a numeric parameter cannot be coerced for AppleScript."""
+
+
+def coerce_script_int(
+    value,
+    *,
+    default: int,
+    lo: int = 1,
+    hi: int = 500,
+    name: str = "value",
+) -> int:
+    """Coerce ``value`` to an ``int`` clamped to ``[lo, hi]`` for AppleScript use.
+
+    Any string interpolated into an AppleScript snippet must be a real integer:
+    if a client passes a string like ``"10\\nend tell\\ndo shell script ..."``,
+    naive ``f"set maxCount to {value}"`` lets attacker bytes escape the literal
+    and execute. This helper rejects bool, parses numeric strings strictly, and
+    clamps the result so callers can safely embed it as ``{count}``.
+
+    Returns ``default`` (also clamped) for ``None`` or empty strings, mirroring
+    the behaviour of optional MCP parameters.
+    """
+    if value is None or value == "":
+        coerced = default
+    elif isinstance(value, bool):
+        raise InvalidScriptIntError(
+            f"{name} must be an integer, not a boolean: {value!r}"
+        )
+    elif isinstance(value, int):
+        coerced = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise InvalidScriptIntError(
+                f"{name} must be a whole number: {value!r}"
+            )
+        coerced = int(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not re.fullmatch(r"-?\d+", stripped):
+            raise InvalidScriptIntError(
+                f"{name} must be an integer, got {value!r}"
+            )
+        coerced = int(stripped)
+    else:
+        raise InvalidScriptIntError(
+            f"{name} must be an integer, got {type(value).__name__}"
+        )
+    return max(lo, min(coerced, hi))
+
+
 # ---------------------------------------------------------------------------
 # Locale-independent date handling
 # ---------------------------------------------------------------------------

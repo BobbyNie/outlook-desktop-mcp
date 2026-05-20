@@ -20,6 +20,8 @@ from outlook_desktop_mcp.utils.applescript_helpers import (
     DELIM,
     RECORD_DELIM,
     InvalidEntryIdError,
+    InvalidScriptIntError,
+    coerce_script_int,
     escape,
     format_date,
     parse_date,
@@ -31,6 +33,7 @@ from outlook_desktop_mcp.utils.attachment_safety import (
     ensure_save_directory,
     resolve_attachment_path,
     sanitize_attachment_filename,
+    validate_readable_attachment,
 )
 from outlook_desktop_mcp.utils.draft_html import (
     InvalidInlineImage,
@@ -210,12 +213,13 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
     This is the fallback for New Outlook for Mac where AppleScript's inbox
     keyword only sees the empty local mailbox.
     """
+    safe_count = coerce_script_int(count, default=10, lo=1, hi=200, name="count")
     script = (
         _UI_MESSAGE_LIST_PATH +
         f'                                    set rowList to rows\n'
         f'                                    set rowCount to count of rowList\n'
         f'                                    set maxRows to rowCount\n'
-        f'                                    if maxRows > {count} then set maxRows to {count}\n'
+        f'                                    if maxRows > {safe_count} then set maxRows to {safe_count}\n'
         f'                                    set output to ""\n'
         f'                                    repeat with i from 1 to maxRows\n'
         f'                                        set r to row i\n'
@@ -292,7 +296,8 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
             subject = ss.strip()
 
         results.append({
-            "entry_id": f"ui-{idx}",
+            "entry_id": None,
+            "ui_row_index": idx,
             "subject": subject or "(could not parse subject)",
             "sender": "",
             "sender_name": sender,
@@ -300,7 +305,15 @@ async def _ui_list_messages(bridge_obj, count: int = 10) -> list[dict]:
             "unread": is_unread,
             "has_attachments": has_attachment,
             "attachment_count": 1 if has_attachment else 0,
+            "read_only": True,
             "_source": "ui_scraping",
+            "_note": (
+                "AppleScript could not return real message IDs for this folder "
+                "(common on New Outlook / M365). These rows are display-only — "
+                "tools like read_email, reply_email, move_email, mark_as_read "
+                "cannot accept entry_id=null. Open the message in Outlook "
+                "manually if you need to act on it."
+            ),
         })
 
     return results
@@ -395,6 +408,10 @@ async def list_emails(
     Returns:
         JSON array of email summary objects.
     """
+    try:
+        safe_count = coerce_script_int(count, default=10, lo=1, hi=200, name="count")
+    except InvalidScriptIntError as e:
+        return f"Error: {e}"
     folder_ref = resolve_folder_ref(folder)
     unread_filter = ' whose is read is false' if unread_only else ''
 
@@ -402,7 +419,7 @@ async def list_emails(
     set folderRef to {folder_ref}
     set allMsgs to messages of folderRef{unread_filter}
     set msgCount to count of allMsgs
-    set maxCount to {count}
+    set maxCount to {safe_count}
     if msgCount < maxCount then set maxCount to msgCount
     set output to ""
     repeat with i from 1 to maxCount
@@ -457,7 +474,7 @@ end tell'''
         # for the inbox, try reading the visible message list via UI scripting.
         if not results and folder.lower().strip() == "inbox":
             try:
-                results = await _ui_list_messages(bridge, count)
+                results = await _ui_list_messages(bridge, safe_count)
             except Exception as ui_err:
                 logger.warning(
                     "UI scraping fallback for inbox failed: %s. "
@@ -891,6 +908,10 @@ async def search_emails(
     Returns:
         JSON array of matching email summaries, or an error.
     """
+    try:
+        safe_count = coerce_script_int(count, default=10, lo=1, hi=200, name="count")
+    except InvalidScriptIntError as e:
+        return f"Error: {e}"
     folder_ref = resolve_folder_ref(folder)
     safe_query = escape(query)
 
@@ -898,7 +919,7 @@ async def search_emails(
     set folderRef to {folder_ref}
     set matchMsgs to messages of folderRef whose subject contains "{safe_query}"
     set msgCount to count of matchMsgs
-    set maxCount to {count}
+    set maxCount to {safe_count}
     if msgCount < maxCount then set maxCount to msgCount
     set output to ""
     repeat with i from 1 to maxCount
@@ -1402,12 +1423,16 @@ async def search_events(
     Returns:
         JSON array of matching event summaries.
     """
+    try:
+        safe_count = coerce_script_int(count, default=10, lo=1, hi=200, name="count")
+    except InvalidScriptIntError as e:
+        return f"Error: {e}"
     safe_query = escape(query)
 
     script = f'''tell application "Microsoft Outlook"
     set evts to calendar events whose subject contains "{safe_query}"
     set evtCount to count of evts
-    set maxCount to {count}
+    set maxCount to {safe_count}
     if evtCount < maxCount then set maxCount to evtCount
     set output to ""
     repeat with i from 1 to maxCount
@@ -1479,12 +1504,16 @@ async def list_tasks(
     Returns:
         JSON array of task summary objects.
     """
+    try:
+        safe_count = coerce_script_int(count, default=20, lo=1, hi=200, name="count")
+    except InvalidScriptIntError as e:
+        return f"Error: {e}"
     completed_filter = "" if include_completed else " whose todo flag is not completed"
 
     script = f'''tell application "Microsoft Outlook"
     set taskList to tasks{completed_filter}
     set taskCount to count of taskList
-    set maxCount to {count}
+    set maxCount to {safe_count}
     if taskCount < maxCount then set maxCount to taskCount
     set output to ""
     repeat with i from 1 to maxCount
@@ -2002,14 +2031,15 @@ def _build_attachment_lines_at(paths: list | None, target: str = "newMsg") -> st
     lines = ""
     if not paths:
         return lines
-    for entry in paths:
+    for index, entry in enumerate(paths):
         if not isinstance(entry, str) or not entry:
             raise ValueError("attachments must be a list of file path strings")
-        if entry.startswith("\\\\") or entry.startswith("//"):
-            raise ValueError(f"UNC paths not allowed for attachment: {entry!r}")
-        abs_path = os.path.abspath(os.path.expanduser(entry))
-        if not os.path.isfile(abs_path):
-            raise ValueError(f"attachment file does not exist: {entry!r}")
+        try:
+            abs_path = validate_readable_attachment(
+                entry, label=f"attachments[{index}]"
+            )
+        except UnsafeAttachmentPath as e:
+            raise ValueError(str(e)) from e
         lines += (
             f'make new attachment at {target} with properties '
             f'{{file:POSIX file "{escape(abs_path)}"}}\n'
@@ -2031,12 +2061,15 @@ async def list_drafts(count: int = 20, account: str = "") -> str:
         count: Maximum drafts to return (1-200). Default 20.
         account: Ignored on macOS (single Outlook profile).
     """
-    count = min(max(1, int(count) if isinstance(count, int) else 20), 200)
+    try:
+        safe_count = coerce_script_int(count, default=20, lo=1, hi=200, name="count")
+    except InvalidScriptIntError as e:
+        return f"Error: {e}"
     script = f'''tell application "Microsoft Outlook"
     set draftFolder to drafts
     set msgs to messages of draftFolder
     set total to count of msgs
-    set maxCount to {count}
+    set maxCount to {safe_count}
     if total < maxCount then set maxCount to total
     set output to ""
     repeat with i from 1 to maxCount
