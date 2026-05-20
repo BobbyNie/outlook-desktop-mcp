@@ -112,27 +112,32 @@ def _cid_already_referenced(html: str, cid: str) -> bool:
 
 
 def prepare_inline_html(
-    body: str,
-    html_body: str,
+    body,
+    html_body,
     inline_images: Iterable | None,
 ) -> tuple[str, list[tuple[str, str]]]:
     """Build the final HTML body and a list of ``(cid, abs_path)`` to attach.
 
-    - When ``html_body`` is provided, it is used as-is (caller is responsible
-      for producing safe HTML).
-    - When only ``body`` is provided, it is converted to HTML with paragraph
-      and line-break preservation.
+    - ``html_body`` may be ``None`` (build from ``body``), the empty string
+      (intentional clear: result is ``""`` plus appended inline-image tags
+      if any), or a string of HTML used as-is.
+    - When ``html_body`` is ``None``, ``body`` is converted to HTML with
+      paragraph and line-break preservation.
     - Each inline image entry's placeholder (if any) is substituted with the
       ``<img>`` tag. Images whose CID is not already referenced in the HTML
-      are appended at the end inside their own ``<p>`` so they are still
-      rendered inline.
+      are appended at the end inside their own ``<p>``.
     """
     images = list(inline_images or [])
     normalized: list[tuple[str, str, str | None]] = []
     for index, entry in enumerate(images):
         normalized.append(_normalize_image_entry(entry, index))
 
-    html = html_body if html_body else plain_to_html(body)
+    # html_body=="" is intentional clear; only convert from plain body when
+    # the caller did not supply any html_body at all (None).
+    if html_body is None:
+        html = plain_to_html(body)
+    else:
+        html = html_body
 
     for cid, _path, placeholder in normalized:
         img_tag = f'<img src="cid:{cid}" alt="">'

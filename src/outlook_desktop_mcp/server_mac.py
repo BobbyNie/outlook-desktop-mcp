@@ -2143,6 +2143,13 @@ async def get_draft(entry_id: str, account: str = "") -> str:
             set mcc to mcc & address of r & "; "
         end repeat
     end try
+    set mbcc to ""
+    try
+        set bccrecips to bcc recipients of m
+        repeat with r in bccrecips
+            set mbcc to mbcc & address of r & "; "
+        end repeat
+    end try
     set mbody to ""
     try
         set mbody to plain text content of m
@@ -2172,14 +2179,14 @@ async def get_draft(entry_id: str, account: str = "") -> str:
             set attLines to attLines & (i as text) & "{DELIM}" & aname & "{DELIM}" & (asize as text) & "{RECORD_DELIM}"
         end repeat
     end try
-    return mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbody & "{DELIM}" & mhtml & "{DELIM}" & mtime & "{DELIM}{DELIM}" & attLines
+    return mid & "{DELIM}" & msubject & "{DELIM}" & mto & "{DELIM}" & mcc & "{DELIM}" & mbcc & "{DELIM}" & mbody & "{DELIM}" & mhtml & "{DELIM}" & mtime & "{DELIM}{DELIM}" & attLines
 end tell'''
 
     try:
         raw = await bridge.run(script)
         head, _, attbuf = raw.partition(f"{DELIM}{DELIM}")
-        parts = head.split(DELIM, 6)
-        if len(parts) < 7:
+        parts = head.split(DELIM, 7)
+        if len(parts) < 8:
             return json.dumps({"error": "Failed to parse draft data"})
 
         attachments = []
@@ -2201,9 +2208,10 @@ end tell'''
             "subject": parts[1].strip() or "(no subject)",
             "to": parts[2].strip(),
             "cc": parts[3].strip(),
-            "body": _truncate(_clean(parts[4])),
-            "html_body": _clean(parts[5]),
-            "last_modified": _clean(parts[6]),
+            "bcc": parts[4].strip(),
+            "body": _truncate(_clean(parts[5])),
+            "html_body": _clean(parts[6]),
+            "last_modified": _clean(parts[7]),
             "attachments": attachments,
         }
         return json.dumps(result, indent=2, default=str)

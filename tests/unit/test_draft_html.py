@@ -29,14 +29,14 @@ def test_prepare_no_images_uses_html_body():
 
 
 def test_prepare_no_images_falls_back_to_plain():
-    html, _ = prepare_inline_html("hi\nthere", "", None)
+    html, _ = prepare_inline_html("hi\nthere", None, None)
     assert "<p>hi<br>there</p>" == html
 
 
 def test_prepare_appends_unreferenced_image(tmp_path):
     img = tmp_path / "logo.png"
     img.write_bytes(b"\x89PNG fake")
-    html, images = prepare_inline_html("see below", "", [str(img)])
+    html, images = prepare_inline_html("see below", None, [str(img)])
     assert len(images) == 1
     cid, path = images[0]
     assert path == str(img)
@@ -117,3 +117,14 @@ def test_plain_to_html_normalizes_crlf():
     out = plain_to_html("line1\r\nline2\rline3")
     assert "<br>line2<br>line3" in out
     assert "\r" not in out
+
+
+def test_empty_html_body_intentionally_clears():
+    html, images = prepare_inline_html("plain body", "", None)
+    assert html == ""
+    assert images == []
+
+
+def test_none_html_body_falls_back_to_plain():
+    html, _ = prepare_inline_html("plain body", None, None)
+    assert "<p>plain body</p>" == html

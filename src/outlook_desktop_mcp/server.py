@@ -2332,7 +2332,10 @@ async def create_draft(
         if bcc:
             mail.BCC = bcc
         try:
-            inline_failures = _apply_draft_body(mail, body, html_body, inline_images)
+            # On create, treat empty html_body as "no HTML supplied" rather
+            # than "clear HTML" — there's nothing pre-existing to clear.
+            html_arg = html_body if html_body else None
+            inline_failures = _apply_draft_body(mail, body, html_arg, inline_images)
             _add_regular_attachments(mail, attachments)
         except (InvalidInlineImage, ValueError) as e:
             return f"Error: {e}"
