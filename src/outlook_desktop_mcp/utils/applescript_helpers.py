@@ -3,56 +3,112 @@ import re
 from datetime import datetime
 
 
+# ---------------------------------------------------------------------------
+# String escaping
+# ---------------------------------------------------------------------------
+
+
 def escape(text: str) -> str:
     """Escape a string for safe embedding inside AppleScript double quotes.
 
-    Handles backslashes, double quotes, and other special characters.
+    Handles backslashes, double quotes, common control chars, and the Unicode
+    line separators (U+2028, U+2029) that AppleScript may treat as statement
+    terminators in some contexts.
     """
     text = text.replace("\\", "\\\\")
     text = text.replace('"', '\\"')
     text = text.replace("\n", "\\n")
     text = text.replace("\r", "\\r")
     text = text.replace("\t", "\\t")
+    text = text.replace("\u2028", "\\n")
+    text = text.replace("\u2029", "\\n")
+    text = text.replace("\x00", "")
+    text = text.replace("\x0b", " ")
+    text = text.replace("\x0c", " ")
     return text
 
 
-def format_date(dt: datetime) -> str:
-    """Convert a Python datetime to an AppleScript date string.
+# ---------------------------------------------------------------------------
+# Entry ID validation (defense against AppleScript injection)
+# ---------------------------------------------------------------------------
 
-    Returns a string like: date "Sunday, March 22, 2026 at 2:00:00 PM"
-    AppleScript parses dates based on the system locale, so we use a
-    locale-friendly format that osascript can interpret.
+_MAC_ENTRY_ID_RE = re.compile(r"\A\d{1,32}\Z")
+
+
+class InvalidEntryIdError(ValueError):
+    """Raised when an entry_id fails validation for AppleScript use."""
+
+
+def validate_mac_entry_id(entry_id) -> str:
+    """Return a sanitized macOS Outlook entry_id (numeric only).
+
+    macOS Outlook entry IDs are numeric AppleScript object IDs. Any other
+    characters — including embedded newlines, surrounding whitespace beyond a
+    simple strip, or punctuation — are rejected to prevent AppleScript
+    injection through string interpolation.
     """
-    return f'date "{dt.strftime("%Y-%m-%d %H:%M:%S")}"'
+    s = str(entry_id).strip()
+    if not _MAC_ENTRY_ID_RE.match(s):
+        raise InvalidEntryIdError(
+            f"Invalid entry_id (must be a positive integer up to 32 digits): {entry_id!r}"
+        )
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Locale-independent date handling
+# ---------------------------------------------------------------------------
+
+# Handler that constructs an AppleScript date deterministically from numeric
+# components. Injected at the top of every script by AppleScriptBridge.
+ODM_DATE_HANDLER = (
+    "on _odm_make_date(y, m, d, h, mn, s)\n"
+    "    set ddd to (current date)\n"
+    "    set year of ddd to y\n"
+    "    set month of ddd to m\n"
+    "    set day of ddd to d\n"
+    "    set hours of ddd to h\n"
+    "    set minutes of ddd to mn\n"
+    "    set seconds of ddd to s\n"
+    "    return ddd\n"
+    "end _odm_make_date\n"
+)
+
+
+def format_date(dt: datetime) -> str:
+    """Return a locale-independent AppleScript expression for ``dt``.
+
+    Relies on the ``_odm_make_date`` handler injected by AppleScriptBridge.
+    """
+    return (
+        f"(my _odm_make_date({dt.year}, {dt.month}, {dt.day}, "
+        f"{dt.hour}, {dt.minute}, {dt.second}))"
+    )
 
 
 def parse_date(text: str) -> str:
-    """Parse an AppleScript date string to ISO 8601 format.
-
-    AppleScript dates look like: "Sunday, March 22, 2026 at 2:00:00 PM"
-    or various locale-specific formats. We attempt several common patterns.
-    """
+    """Parse an AppleScript date string into ISO 8601, or return raw on failure."""
     text = text.strip()
-    # Remove day name prefix if present (e.g., "Sunday, ")
     text = re.sub(r"^\w+day,\s*", "", text)
-    # Remove " at " between date and time
     text = text.replace(" at ", " ")
-    # Try common formats
     for fmt in (
-        "%B %d, %Y %I:%M:%S %p",   # March 22, 2026 2:00:00 PM
-        "%d. %B %Y %H:%M:%S",       # 22. mars 2026 14:00:00 (Norwegian)
-        "%Y-%m-%d %H:%M:%S",        # 2026-03-22 14:00:00
-        "%d/%m/%Y %H:%M:%S",        # 22/03/2026 14:00:00
-        "%m/%d/%Y %H:%M:%S",        # 03/22/2026 14:00:00
+        "%B %d, %Y %I:%M:%S %p",
+        "%d. %B %Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
     ):
         try:
             dt = datetime.strptime(text, fmt)
             return dt.isoformat()
         except ValueError:
             continue
-    # Fallback: return as-is
     return text
 
+
+# ---------------------------------------------------------------------------
+# Folder references
+# ---------------------------------------------------------------------------
 
 # Locale-independent AppleScript folder keywords
 FOLDER_MAP = {
@@ -71,18 +127,19 @@ FOLDER_MAP = {
 
 
 def resolve_folder_ref(folder_name: str) -> str:
-    """Map a user-facing folder name to an AppleScript folder reference.
-
-    Returns an AppleScript expression like 'inbox' or 'mail folder "Archive"'.
-    Built-in folders use locale-independent keywords; custom folders use name lookup.
-    """
+    """Map a user-facing folder name to an AppleScript folder reference."""
     key = folder_name.lower().strip()
     if key in FOLDER_MAP:
         return FOLDER_MAP[key]
-    # Custom folder — search by name
     return f'mail folder "{escape(folder_name)}"'
 
 
-# Delimiter used for structured AppleScript output
-DELIM = "|||"
-RECORD_DELIM = "==="
+# ---------------------------------------------------------------------------
+# Output framing
+# ---------------------------------------------------------------------------
+
+# ASCII Unit Separator / Record Separator. These bytes never appear in normal
+# email content (subjects, bodies, attachment names), eliminating the
+# collisions that ``|||``/``===`` had with real-world data.
+DELIM = "\x1f"
+RECORD_DELIM = "\x1e"

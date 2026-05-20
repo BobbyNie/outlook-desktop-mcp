@@ -11,6 +11,19 @@ if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
 
+# Script-style legacy validation files: keep available for manual `python tests/<name>.py`
+# runs but exclude from pytest's automatic collection (they predate pytest and contain
+# ``def test_*`` helpers that aren't real pytest tests).
+collect_ignore = [
+    "phase1_com_test.py",
+    "calendar_com_test.py",
+    "extras_com_test.py",
+    "phase3_mcp_test.py",
+    "calendar_mcp_test.py",
+    "extras_mcp_test.py",
+]
+
+
 def outlook_integration_enabled() -> bool:
     return os.environ.get("RUN_OUTLOOK_INTEGRATION", "").strip() in ("1", "true", "yes")
 
