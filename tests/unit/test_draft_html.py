@@ -128,3 +128,27 @@ def test_empty_html_body_intentionally_clears():
 def test_none_html_body_falls_back_to_plain():
     html, _ = prepare_inline_html("plain body", None, None)
     assert "<p>plain body</p>" == html
+
+
+def test_prepare_rejects_duplicate_cids(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    img = tmp_path / "x.png"
+    img.write_bytes(b"x")
+    with pytest.raises(InvalidInlineImage, match="duplicates an earlier"):
+        prepare_inline_html(
+            "",
+            "<p>{{A}} {{B}}</p>",
+            [
+                {"path": str(img), "cid": "shared", "placeholder": "{{A}}"},
+                {"path": str(img), "cid": "shared", "placeholder": "{{B}}"},
+            ],
+        )
+
+
+def test_prepare_rejects_outside_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+    outside = "/etc/hostname"
+    if not os.path.isfile(outside):
+        pytest.skip("/etc/hostname not present")
+    with pytest.raises(InvalidInlineImage):
+        prepare_inline_html("", "", [outside])

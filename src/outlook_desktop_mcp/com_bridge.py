@@ -12,6 +12,10 @@ The bridge serializes work onto a single STA thread. To avoid one slow
 operation cascading into wedging the whole server, ``call`` supports a
 per-call timeout and refuses to queue a new request while a previous one
 is still in flight (the COM thread cannot be cancelled mid-COM-call).
+
+When Outlook crashes or is force-closed, the cached ``Outlook.Application``
+and ``MAPI`` namespace references become RPC-disconnected. The bridge
+detects those errors and re-Dispatches once before propagating the failure.
 """
 import asyncio
 import logging
@@ -25,13 +29,55 @@ logger = logging.getLogger("outlook_desktop_mcp.com_bridge")
 DEFAULT_CALL_TIMEOUT = float(os.environ.get("OUTLOOK_MCP_COM_TIMEOUT", "60"))
 DEFAULT_START_TIMEOUT = float(os.environ.get("OUTLOOK_MCP_COM_START_TIMEOUT", "15"))
 
+# HRESULTs that mean "the Outlook process / RPC channel is gone". Re-Dispatch
+# may recover; we only retry once per call to avoid masking persistent errors.
+_RPC_DISCONNECTED_HRESULTS = frozenset({
+    0x80010108,  # RPC_E_DISCONNECTED
+    0x800706BA,  # RPC server unavailable
+    0x800706BE,  # remote procedure call failed
+    0x80010105,  # RPC_E_SERVERFAULT
+    0x800706BF,  # RPC failed, did not execute
+})
+
+
+def _is_rpc_disconnected(exc: Exception) -> bool:
+    """Return True if ``exc`` indicates the Outlook process / RPC channel is gone."""
+    hresult = getattr(exc, "hresult", None)
+    if hresult is None:
+        args = getattr(exc, "args", ())
+        if args and isinstance(args[0], int):
+            hresult = args[0]
+    if hresult is None:
+        return False
+    return (int(hresult) & 0xFFFFFFFF) in _RPC_DISCONNECTED_HRESULTS
+
 
 class ComBridgeBusyError(RuntimeError):
     """Raised when a new COM request is submitted while another is in flight."""
 
+    code = "com_busy"
+    retriable = True
+
 
 class ComBridgeTimeoutError(TimeoutError):
-    """Raised when a COM call exceeds its timeout."""
+    """Raised when a COM call exceeds its timeout.
+
+    Important: COM has no cancellation. The underlying operation (Send,
+    Delete, Move, etc.) may still complete on the Outlook side after the
+    caller sees this error. Callers performing destructive operations should
+    surface ``retriable=False`` and prompt the user to verify in the Outlook
+    UI before retrying.
+    """
+
+    code = "com_timeout"
+    retriable = False
+
+
+class ComBridgeDisconnectedError(RuntimeError):
+    """Raised when Outlook RPC is disconnected and re-Dispatch failed."""
+
+    code = "com_disconnected"
+    retriable = True
 
 
 class OutlookBridge:
@@ -65,6 +111,37 @@ class OutlookBridge:
                 "Is Outlook Desktop (Classic) running?"
             )
 
+    def _redispatch_outlook(self) -> None:
+        """Drop cached references and re-Dispatch Outlook.Application.
+
+        Called on the COM thread only, after detecting RPC_E_DISCONNECTED.
+        Caller already holds the in-flight lock.
+        """
+        import win32com.client
+
+        logger.warning("Outlook COM disconnected; attempting re-Dispatch")
+        self._outlook = None
+        self._namespace = None
+        self._outlook = win32com.client.Dispatch("Outlook.Application")
+        self._namespace = self._outlook.GetNamespace("MAPI")
+        logger.info("Outlook COM re-Dispatch succeeded")
+
+    def _invoke(self, func, args, kwargs):
+        """Run func once; on RPC disconnect, re-Dispatch and retry once."""
+        try:
+            return func(self._outlook, self._namespace, *args, **kwargs)
+        except Exception as e:
+            if not _is_rpc_disconnected(e):
+                raise
+            try:
+                self._redispatch_outlook()
+            except Exception as redispatch_err:
+                raise ComBridgeDisconnectedError(
+                    "Outlook RPC is disconnected and re-Dispatch failed. "
+                    "Restart Outlook Desktop and try again."
+                ) from redispatch_err
+            return func(self._outlook, self._namespace, *args, **kwargs)
+
     def _com_thread_main(self):
         """Main loop for the COM thread."""
         import pythoncom
@@ -95,9 +172,7 @@ class OutlookBridge:
                 except queue.Empty:
                     continue
                 try:
-                    result_holder["value"] = func(
-                        self._outlook, self._namespace, *args, **kwargs
-                    )
+                    result_holder["value"] = self._invoke(func, args, kwargs)
                 except Exception as e:
                     result_holder["error"] = e
                 finally:
@@ -105,6 +180,8 @@ class OutlookBridge:
 
             self._drain_pending("COM bridge is shutting down")
         finally:
+            self._outlook = None
+            self._namespace = None
             pythoncom.CoUninitialize()
 
     def _drain_pending(self, message: str):
@@ -157,7 +234,9 @@ class OutlookBridge:
             if not signaled:
                 raise ComBridgeTimeoutError(
                     f"Outlook COM operation '{label}' timed out after "
-                    f"{timeout_val:.0f}s. Outlook may be waiting on a dialog."
+                    f"{timeout_val:.0f}s. Outlook may be waiting on a dialog. "
+                    f"If the operation modifies data (send/delete/move), verify "
+                    f"in Outlook before retrying — the call may still complete."
                 )
             if "error" in result_holder:
                 raise result_holder["error"]

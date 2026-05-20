@@ -30,11 +30,11 @@ _CID_REFERENCE_BOUNDARY = re.compile(r"[A-Za-z0-9._\-]")
 from outlook_desktop_mcp.utils.attachment_safety import (
     UnsafeAttachmentPath,
     sanitize_attachment_filename,
+    validate_readable_attachment,
 )
 
 
 _CID_RE = re.compile(r"^[A-Za-z0-9._\-]{1,60}$")
-_DANGEROUS_PATH_PREFIX = ("\\\\", "//")
 
 
 class InvalidInlineImage(ValueError):
@@ -65,15 +65,12 @@ def _normalize_image_entry(entry, index: int) -> tuple[str, str, str | None]:
 
     if not path or not isinstance(path, str):
         raise InvalidInlineImage(f"inline_images[{index}].path is required")
-    if any(path.startswith(p) for p in _DANGEROUS_PATH_PREFIX):
-        raise InvalidInlineImage(
-            f"inline_images[{index}].path: UNC paths are not allowed"
+    try:
+        abs_path = validate_readable_attachment(
+            path, label=f"inline_images[{index}]"
         )
-    abs_path = os.path.abspath(os.path.expanduser(path))
-    if not os.path.isfile(abs_path):
-        raise InvalidInlineImage(
-            f"inline_images[{index}].path does not exist: {path!r}"
-        )
+    except UnsafeAttachmentPath as e:
+        raise InvalidInlineImage(str(e)) from e
     if cid is None:
         cid = _generate_cid(abs_path, index)
     if not _CID_RE.match(cid):
@@ -131,8 +128,15 @@ def prepare_inline_html(
     """
     images = list(inline_images or [])
     normalized: list[tuple[str, str, str | None]] = []
+    seen_cids: set[str] = set()
     for index, entry in enumerate(images):
-        normalized.append(_normalize_image_entry(entry, index))
+        cid, abs_path, placeholder = _normalize_image_entry(entry, index)
+        if cid in seen_cids:
+            raise InvalidInlineImage(
+                f"inline_images[{index}].cid duplicates an earlier image: {cid!r}"
+            )
+        seen_cids.add(cid)
+        normalized.append((cid, abs_path, placeholder))
 
     # html_body=="" is intentional clear; only convert from plain body when
     # the caller did not supply any html_body at all (None).
