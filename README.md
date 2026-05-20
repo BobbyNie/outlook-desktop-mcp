@@ -38,8 +38,8 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (29 tools)    │    │  Bridge          │
-              │                │    │  (22 tools)      │
+              │  (39 tools)    │    │  Bridge          │
+              │                │    │  (32 tools)      │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -116,7 +116,7 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `send_email` | yes | yes | Send an email with To/CC/BCC, plain text or HTML body |
 | `list_emails` | yes | yes | List recent emails from any folder, with optional unread filter |
 | `read_email` | yes | yes | Read full email content by entry ID or subject search |
-| `search_emails` | yes | yes | Full-text search across email subjects and bodies |
+| `search_emails` | yes | yes* | Search subjects + bodies (Windows). macOS scans subjects only. |
 | `reply_email` | yes | yes | Reply or reply-all, preserving the conversation thread |
 | `mark_as_read` | yes | yes | Mark a specific email as read |
 | `mark_as_unread` | yes | yes | Mark a specific email as unread |
@@ -153,6 +153,38 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_attachments` | yes | yes | List all attachments on an email or calendar event |
 | `save_attachment` | yes | yes | Download an attachment to a local directory |
 
+### Drafts (rich text + inline images)
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_drafts` | yes | yes | List unsent drafts, sorted by last modified |
+| `get_draft` | yes | yes | Read a draft including HTML body and attachment metadata |
+| `create_draft` | yes | yes* | Save a new draft with optional HTML body and inline images |
+| `update_draft` | yes | yes* | Edit fields, body, or attachments on an existing draft |
+| `send_draft` | yes | yes | Send a previously saved draft |
+| `delete_draft` | yes | yes | Permanently delete a draft |
+
+`create_draft` / `update_draft` accept:
+
+- `body` (plain text, always saved as fallback)
+- `html_body` (rich HTML — supports formatting, tables, links, etc.)
+- `inline_images`: list of file paths or `{"path": "/abs/x.png", "cid": "logo1", "placeholder": "{{LOGO}}"}` dicts. The HTML may reference them via `<img src="cid:logo1">` or `{{LOGO}}` placeholders. Unreferenced images are appended at the end of the body.
+- `attachments`: list of file paths for ordinary (non-inline) attachments.
+
+\*On Outlook for Mac, inline images are added as ordinary attachments — AppleScript cannot reliably set the per-attachment Content-ID required for true inline rendering. Recipients will see them as separate attachments.
+
+### Contacts (address book)
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_contacts` | yes | yes* | List items from the **Contacts folder** (sorted A–Z) |
+| `search_contacts` | yes | yes* | Search **Contacts folder** by name/email (not full GAL) |
+| `resolve_recipient` | yes | yes* | Resolve a name to email; **Windows uses GAL** via COM |
+
+**Caching:** Successful results are cached in memory for **7 days** (max **256** entries, LRU eviction). Failed resolutions and empty macOS results are not cached. Restart the MCP server to refresh after editing contacts.
+
+\*macOS: AppleScript `contacts` only; scans up to **500** (list) or **1000** (search/resolve) local contacts. No GAL. If AppleScript contacts are unavailable, tools return a clear error.
+
 ### Categories, Rules, Out of Office (Windows only)
 
 These tools rely on COM-specific APIs (MAPI property accessors, the Rules object model, and the Categories collection) that Outlook for Mac does not expose through AppleScript.
@@ -165,7 +197,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 39 tools on Windows, 31 tools on macOS** (including 6 new draft tools on each platform).
 
 ## Architecture Details
 
@@ -300,8 +332,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (29 tools, COM automation)
-    server_mac.py            # macOS MCP server (22 tools, AppleScript)
+    server.py                # Windows MCP server (39 tools, COM automation)
+    server_mac.py            # macOS MCP server (32 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/

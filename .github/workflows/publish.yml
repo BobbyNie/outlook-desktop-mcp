@@ -5,7 +5,12 @@ on:
     branches: [main]
 
 jobs:
+  unit:
+    name: Unit tests gate
+    uses: ./.github/workflows/test.yml
+
   publish:
+    needs: unit
     runs-on: ubuntu-latest
     environment: main
     permissions:
@@ -19,7 +24,28 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build
+        run: pip install build packaging requests
+
+      - name: Verify version bump
+        run: |
+          python - <<'PY'
+          import json, sys, urllib.request
+          import tomllib
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as f:
+              local = Version(tomllib.load(f)["project"]["version"])
+          try:
+              with urllib.request.urlopen("https://pypi.org/pypi/outlook-desktop-mcp/json", timeout=15) as r:
+                  pypi_version = Version(json.load(r)["info"]["version"])
+          except Exception as e:
+              print(f"Could not fetch PyPI metadata ({e}); skipping bump check.")
+              sys.exit(0)
+          if local <= pypi_version:
+              print(f"Refusing to publish: pyproject version {local} is not greater than PyPI {pypi_version}.", file=sys.stderr)
+              sys.exit(1)
+          print(f"Version bump OK: {pypi_version} -> {local}")
+          PY
 
       - name: Build package
         run: python -m build
