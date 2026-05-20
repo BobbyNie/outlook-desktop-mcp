@@ -14,6 +14,11 @@ _DANGEROUS_EXTS = {
     ".js", ".jse", ".wsf", ".wsh", ".msi", ".cpl", ".reg",
 }
 
+# Default per-file cap for attachments the server reads from disk. Exchange Online
+# rejects messages larger than ~25 MiB; oversized files almost always indicate a
+# mistake or a path the LLM was tricked into supplying.
+DEFAULT_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
 
 class UnsafeAttachmentPath(ValueError):
     """Raised when a requested save location is rejected."""
@@ -109,6 +114,71 @@ def sanitize_attachment_filename(name: str, *, neutralize_dangerous_ext: bool = 
         if ext.lower() in _DANGEROUS_EXTS:
             base = f"{stem}{ext}.txt"
     return base
+
+
+def validate_readable_attachment(
+    path: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
+    label: str = "attachment",
+) -> str:
+    """Validate that ``path`` is a regular file inside an allowed root.
+
+    The MCP server reads files from disk to attach to outgoing mail. Without
+    this guard an LLM prompt can attach arbitrary local files (SSH keys, AWS
+    credentials, browser cookies) and exfiltrate them via ``send_email``.
+
+    Rules:
+    - UNC / network share paths are rejected up-front.
+    - The path must resolve (via ``realpath``) to a regular file inside the
+      user's home directory or the system temp dir.
+    - The file size must not exceed ``max_bytes`` (default 25 MiB).
+
+    Returns the canonical absolute path (after ``realpath`` resolution).
+    Raises :class:`UnsafeAttachmentPath` with a user-actionable message on
+    rejection. ``label`` is included in error messages so the caller can
+    distinguish inline images from regular attachments.
+    """
+    if not isinstance(path, str) or not path:
+        raise UnsafeAttachmentPath(f"{label} path must be a non-empty string")
+    if path.startswith("\\\\") or path.startswith("//"):
+        raise UnsafeAttachmentPath(
+            f"UNC and network share paths are not allowed for {label}: {path!r}"
+        )
+
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    try:
+        real_path = os.path.realpath(abs_path)
+    except OSError as e:
+        raise UnsafeAttachmentPath(
+            f"Could not resolve {label} path {path!r}: {e}"
+        ) from e
+
+    if not os.path.isfile(real_path):
+        raise UnsafeAttachmentPath(
+            f"{label} file does not exist or is not a regular file: {path!r}"
+        )
+
+    roots = _allowed_roots()
+    if not any(_is_under(real_path, root) for root in roots):
+        raise UnsafeAttachmentPath(
+            f"{label} path must be inside the user's home directory or the "
+            f"system temp dir (got {path!r})."
+        )
+
+    try:
+        size = os.path.getsize(real_path)
+    except OSError as e:
+        raise UnsafeAttachmentPath(
+            f"Could not stat {label} {path!r}: {e}"
+        ) from e
+    if size > max_bytes:
+        raise UnsafeAttachmentPath(
+            f"{label} {path!r} is {size} bytes which exceeds the "
+            f"{max_bytes}-byte limit; pass a smaller file or raise the limit."
+        )
+
+    return real_path
 
 
 def resolve_attachment_path(save_directory: str, filename: str) -> str:
