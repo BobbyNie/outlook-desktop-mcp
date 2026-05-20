@@ -42,7 +42,9 @@ class InvalidInlineImage(ValueError):
 
 
 def _generate_cid(path: str, index: int) -> str:
-    digest = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha1(
+        os.path.abspath(path).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:10]
     return f"img{index}_{digest}"
 
 
