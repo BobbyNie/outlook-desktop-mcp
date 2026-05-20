@@ -46,6 +46,31 @@ def should_cache_contact_result(
     return isinstance(data, dict)
 
 
+def contact_matches_query(contact: dict, query: str) -> bool:
+    """True if query is a case-insensitive substring of name/email/company."""
+    needle = query.casefold()
+    if not needle:
+        return False
+    for key in ("full_name", "email", "company"):
+        if needle in (contact.get(key) or "").casefold():
+            return True
+    return False
+
+
+def pick_best_contact_match(contacts: list[dict], name: str) -> dict | None:
+    """Prefer exact then partial full_name match; else first result."""
+    if not contacts:
+        return None
+    needle = name.casefold()
+    for contact in contacts:
+        if (contact.get("full_name") or "").casefold() == needle:
+            return contact
+    for contact in contacts:
+        if needle in (contact.get("full_name") or "").casefold():
+            return contact
+    return contacts[0]
+
+
 def sort_contacts_by_name(contacts: list[dict]) -> list[dict]:
     """Sort contact dicts by full_name (case-insensitive)."""
     return sorted(

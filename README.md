@@ -183,6 +183,8 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 
 **Caching:** Successful results are cached in memory for **7 days** (max **256** entries, LRU eviction). Failed resolutions and empty macOS results are not cached. Restart the MCP server to refresh after editing contacts.
 
+**Windows offline / corporate:** `resolve_recipient` queries the Global Address List (including the **offline address book** when cached). If GAL access is blocked, the tool falls back to the local **Contacts folder**. Approve Outlook's *programmatic access* prompt for address information (see [Trust Center](#outlook-programmatic-access-security-prompts) above), run **Send/Receive** to refresh the OAB, and ensure the person exists in Contacts or the downloaded GAL. `search_contacts` uses DASL first and automatically rescans the Contacts folder in Python when Restrict fails (common on Outlook 2019 with non-ASCII names).
+
 \*macOS: AppleScript `contacts` only; scans up to **500** (list) or **1000** (search/resolve) local contacts. No GAL. If AppleScript contacts are unavailable, tools return a clear error.
 
 ### Categories, Rules, Out of Office (Windows only)

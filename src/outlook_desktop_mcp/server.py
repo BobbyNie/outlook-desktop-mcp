@@ -62,7 +62,9 @@ from outlook_desktop_mcp.utils.dasl import dasl_date_literal
 from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
+    contact_matches_query,
     normalize_search_query,
+    pick_best_contact_match,
     should_cache_contact_result,
 )
 
@@ -1897,6 +1899,51 @@ def _iter_contact_items(items, limit: int):
             continue
 
 
+def _contact_dasl_filter(query: str) -> str:
+    """Build a DASL @SQL filter for the Contacts folder (locale-safe LIKE)."""
+    safe = _safe_dasl(query.replace("\xa0", " "))
+    parts = [
+        f'("urn:schemas:contacts:cn" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email1" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email2" LIKE \'%{safe}%\')',
+        f'("urn:schemas:contacts:email3" LIKE \'%{safe}%\')',
+    ]
+    return "@SQL=" + " OR ".join(parts)
+
+
+def _search_contacts_in_python(folder, query: str, count: int) -> list[dict]:
+    """Scan the Contacts folder in Python when Items.Restrict fails."""
+    scan_limit = min(max(count * 50, count), 2000)
+    items = folder.Items
+    try:
+        items.Sort("[FullName]", False)
+    except Exception:
+        pass
+    results: list[dict] = []
+    for item in _iter_contact_items(items, scan_limit):
+        summary = format_contact_summary(item)
+        if contact_matches_query(summary, query):
+            results.append(summary)
+            if len(results) >= count:
+                break
+    return results
+
+
+def _resolve_via_contacts_folder(folder, name: str) -> dict | None:
+    """Best-effort match in the local Contacts folder (no GAL)."""
+    matches = _search_contacts_in_python(folder, name, count=20)
+    contact = pick_best_contact_match(matches, name)
+    if not contact or not contact.get("email"):
+        return None
+    return {
+        "resolved": True,
+        "name": contact.get("full_name") or name,
+        "email": contact["email"],
+        "address_type": "SMTP",
+        "source": "contacts_folder",
+    }
+
+
 @mcp.tool()
 async def list_contacts(count: int = 50, account: str = "") -> str:
     """List contacts from the Outlook Contacts folder (not the full GAL).
@@ -1971,18 +2018,21 @@ async def search_contacts(
     def _search(outlook, namespace, query, count, account):
         store = _require_store(namespace, account)
         folder = _get_contacts_folder(store)
-        safe = _safe_dasl(query)
-        filter_str = (
-            f"([FullName] LIKE '%{safe}%') OR "
-            f"([Email1Address] LIKE '%{safe}%') OR "
-            f"([Email2Address] LIKE '%{safe}%') OR "
-            f"([Email3Address] LIKE '%{safe}%')"
-        )
-        items = folder.Items.Restrict(filter_str)
-        items.Sort("[FullName]", False)
-        results = []
-        for item in _iter_contact_items(items, count):
-            results.append(format_contact_summary(item))
+        results: list[dict] = []
+        try:
+            items = folder.Items.Restrict(_contact_dasl_filter(query))
+            try:
+                items.Sort("[FullName]", False)
+            except Exception:
+                pass
+            for item in _iter_contact_items(items, count):
+                results.append(format_contact_summary(item))
+        except Exception as exc:
+            logger.warning(
+                "Contacts Restrict failed (%s); falling back to Python scan",
+                exc,
+            )
+            results = _search_contacts_in_python(folder, query, count)
         return json.dumps(results, indent=2, default=str)
 
     try:
@@ -2021,24 +2071,43 @@ async def resolve_recipient(name: str, account: str = "") -> str:
         return cached
 
     def _resolve(outlook, namespace, name, account):
-        _ = _require_store(namespace, account)  # validate account if provided
-        recipient = outlook.CreateRecipient(name)
-        resolved = recipient.Resolve()
-        if not resolved:
-            return json.dumps({
-                "resolved": False,
-                "name": name,
-                "email": "",
-                "address_type": "",
-                "message": "Could not resolve recipient",
-            }, indent=2)
-        entry = recipient.AddressEntry
-        return json.dumps({
-            "resolved": True,
-            "name": entry.Name or name,
-            "email": entry.Address or "",
-            "address_type": getattr(entry, "Type", "") or "",
-        }, indent=2, default=str)
+        store = _require_store(namespace, account)
+        folder = _get_contacts_folder(store)
+        gal_error: str | None = None
+        try:
+            recipient = outlook.CreateRecipient(name)
+            resolved = recipient.Resolve()
+            if resolved:
+                entry = recipient.AddressEntry
+                return json.dumps({
+                    "resolved": True,
+                    "name": entry.Name or name,
+                    "email": entry.Address or "",
+                    "address_type": getattr(entry, "Type", "") or "",
+                    "source": "gal",
+                }, indent=2, default=str)
+        except Exception as exc:
+            gal_error = format_com_error(exc)
+            logger.warning("GAL resolve failed for %r: %s", name, gal_error)
+
+        local = _resolve_via_contacts_folder(folder, name)
+        if local is not None:
+            return json.dumps(local, indent=2, default=str)
+
+        payload = {
+            "resolved": False,
+            "name": name,
+            "email": "",
+            "address_type": "",
+            "message": (
+                "Could not resolve recipient via Global Address List or "
+                "the local Contacts folder. Sync the offline address book "
+                "in Outlook, or add the person to Contacts."
+            ),
+        }
+        if gal_error:
+            payload["gal_error"] = gal_error
+        return json.dumps(payload, indent=2)
 
     try:
         result = await bridge.call(_resolve, normalized_name, account)

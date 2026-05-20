@@ -5,7 +5,9 @@ import pytest
 
 from outlook_desktop_mcp.utils.contact_helpers import (
     clamp_contact_count,
+    contact_matches_query,
     normalize_search_query,
+    pick_best_contact_match,
     should_cache_contact_result,
     sort_contacts_by_name,
 )
@@ -36,6 +38,22 @@ def test_should_cache_empty_list_when_disabled():
     assert not should_cache_contact_result(
         empty, tool="mac:list_contacts", allow_empty_list=False
     )
+
+
+def test_contact_matches_query_chinese():
+    contact = {"full_name": "周尔康", "email": "zhou@example.com", "company": "BOCM"}
+    assert contact_matches_query(contact, "周尔康")
+    assert contact_matches_query(contact, "zhou@")
+    assert not contact_matches_query(contact, "张三")
+
+
+def test_pick_best_contact_match_prefers_exact():
+    contacts = [
+        {"full_name": "周尔康 Jr", "email": "j@x.com"},
+        {"full_name": "周尔康", "email": "z@x.com"},
+    ]
+    best = pick_best_contact_match(contacts, "周尔康")
+    assert best["email"] == "z@x.com"
 
 
 def test_sort_contacts_by_name():
