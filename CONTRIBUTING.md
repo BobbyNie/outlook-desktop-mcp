@@ -64,8 +64,27 @@ pytest                         # runs tests/unit by default
 outlook-desktop-mcp.cmd test-unit
 ```
 
-CI runs the unit suite on ubuntu/macOS/windows with Python 3.10–3.13 on every
-push and PR. `publish.yml` will not push to PyPI unless the unit suite passes
+CI runs on every push and pull request:
+
+- **Unit tests** (`.github/workflows/test.yml`) — ubuntu/macOS/windows with Python
+  3.10–3.13; gates PyPI publish.
+- **Security** (`.github/workflows/security.yml`) — `pip-audit` on installed
+  dependencies and `bandit` on `src/outlook_desktop_mcp` (medium severity and
+  above); also gates publish.
+- **Integration** (optional, same test workflow) — Windows job with
+  `RUN_OUTLOOK_INTEGRATION=1`; `continue-on-error` because GitHub-hosted runners
+  usually lack Outlook.
+
+Run locally:
+
+```bash
+pip install -e ".[dev]"
+pytest
+python -m pip_audit
+python -m bandit -r src/outlook_desktop_mcp -ll -c pyproject.toml
+```
+
+`publish.yml` will not push to PyPI unless unit tests and security checks pass
 **and** `pyproject.toml`'s version is greater than the current PyPI release.
 
 ### Integration tests (require real Outlook)

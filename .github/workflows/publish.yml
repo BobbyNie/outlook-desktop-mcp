@@ -9,8 +9,12 @@ jobs:
     name: Unit tests gate
     uses: ./.github/workflows/test.yml
 
+  security:
+    name: Security gate
+    uses: ./.github/workflows/security.yml
+
   publish:
-    needs: unit
+    needs: [unit, security]
     runs-on: ubuntu-latest
     environment: main
     permissions:
