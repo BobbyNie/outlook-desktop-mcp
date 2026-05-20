@@ -38,8 +38,8 @@ When the server starts, it checks which operating system it is running on and ta
               ┌───────┴────────┐    ┌────────┴────────┐
               │  server.py     │    │  server_mac.py   │
               │  COM Bridge    │    │  AppleScript     │
-              │  (29 tools)    │    │  Bridge          │
-              │                │    │  (22 tools)      │
+              │  (33 tools)    │    │  Bridge          │
+              │                │    │  (25 tools)      │
               └───────┬────────┘    └────────┬─────────┘
                       |                      |
               OUTLOOK.EXE via         Microsoft Outlook
@@ -153,6 +153,18 @@ Both permissions are one-time setup — macOS remembers them for future sessions
 | `list_attachments` | yes | yes | List all attachments on an email or calendar event |
 | `save_attachment` | yes | yes | Download an attachment to a local directory |
 
+### Contacts (address book)
+
+Contact query results are cached **in memory for 7 days** per unique query. Restart the MCP server to force a refresh after contact changes.
+
+| Tool | Windows | macOS | Description |
+|------|:-------:|:-----:|-------------|
+| `list_contacts` | yes | yes* | List contacts from the address book, sorted by name |
+| `search_contacts` | yes | yes* | Search contacts by name or email |
+| `resolve_recipient` | yes | yes* | Resolve a display name or alias to an email (GAL on Windows) |
+
+\*macOS depends on Outlook's AppleScript `contacts` collection; if unavailable, tools return a clear error.
+
 ### Categories, Rules, Out of Office (Windows only)
 
 These tools rely on COM-specific APIs (MAPI property accessors, the Rules object model, and the Categories collection) that Outlook for Mac does not expose through AppleScript.
@@ -165,7 +177,7 @@ These tools rely on COM-specific APIs (MAPI property accessors, the Rules object
 | `toggle_rule` | yes | — | Enable or disable a mail rule by name |
 | `get_out_of_office` | yes | — | Check whether Out of Office auto-reply is on or off |
 
-**Total: 29 tools on Windows, 22 tools on macOS.**
+**Total: 33 tools on Windows, 25 tools on macOS** (including `list_accounts` on Windows).
 
 ## Architecture Details
 
@@ -300,8 +312,8 @@ Windows-only examples:
 outlook-desktop-mcp/
   src/outlook_desktop_mcp/
     entrypoint.py            # Platform detection → routes to correct server
-    server.py                # Windows MCP server (29 tools, COM automation)
-    server_mac.py            # macOS MCP server (22 tools, AppleScript)
+    server.py                # Windows MCP server (33 tools, COM automation)
+    server_mac.py            # macOS MCP server (25 tools, AppleScript)
     com_bridge.py            # Async-to-COM threading bridge (Windows)
     applescript_bridge.py    # Async osascript execution (macOS)
     tools/

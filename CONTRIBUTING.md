@@ -40,15 +40,31 @@ python .venv\Scripts\pywin32_postinstall.py -install
 
 ## Testing
 
+### Unit tests (no Outlook required — runs in CI)
+
+```bash
+pip install -e ".[dev]"
+pytest tests/unit -q
+# or on Windows:
+outlook-desktop-mcp.cmd test-unit
+```
+
+### Integration tests (Windows + Classic Outlook)
+
 With Outlook Desktop (Classic) open:
 
 ```bash
+set RUN_OUTLOOK_INTEGRATION=1
+
 # COM validation (no MCP layer)
 outlook-desktop-mcp.cmd test
 
-# MCP protocol test
-.venv\Scripts\python tests\phase3_mcp_test.py
+# MCP protocol tests
+pytest tests/contacts_mcp_test.py -v
+python tests\phase3_mcp_test.py
 ```
+
+Contact tools are cached in memory for 7 days; restart the MCP server to refresh after editing contacts in Outlook.
 
 ## Adding New Tools
 

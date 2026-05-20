@@ -24,6 +24,7 @@ from outlook_desktop_mcp.tools._folder_constants import (
     OL_MAIL_ITEM,
     OL_APPOINTMENT_ITEM,
     OL_FOLDER_CALENDAR,
+    OL_FOLDER_CONTACTS,
     OL_FOLDER_TASKS,
     OL_MEETING,
     OL_MEETING_CANCELED,
@@ -44,8 +45,10 @@ from outlook_desktop_mcp.utils.formatting import (
     format_event_full,
     format_task_summary,
     format_task_full,
+    format_contact_summary,
 )
 from outlook_desktop_mcp.utils.errors import format_com_error
+from outlook_desktop_mcp.utils.contact_cache import ContactCache
 
 # --- Logging (all to stderr, stdout is reserved for MCP JSON-RPC) ---
 
@@ -72,6 +75,7 @@ def _safe_dasl(query: str) -> str:
 _OL_CLASS_MAIL = 43
 _OL_CLASS_APPOINTMENT = 26
 _OL_CLASS_TASK = 48
+_OL_CLASS_CONTACT = 40
 
 
 def _check_item_class(item, expected_class: int, label: str) -> str | None:
@@ -104,11 +108,14 @@ mcp = FastMCP(
         "- Categories: list and set color categories on any item\n"
         "- Rules: list and manage mail rules\n"
         "- Out of Office: check auto-reply status\n"
-        "- Folders: list folder hierarchy with item counts"
+        "- Folders: list folder hierarchy with item counts\n"
+        "- Contacts: search and list address book entries, resolve names to email "
+        "(results cached in memory for 7 days)"
     ),
 )
 
 bridge = OutlookBridge()
+contact_cache = ContactCache()
 
 
 # --- Helper: resolve store by account name ---
@@ -1755,6 +1762,174 @@ async def toggle_rule(
         return await bridge.call(_toggle, rule_name, enabled, account)
     except Exception as e:
         return f"Error toggling rule: {format_com_error(e)}"
+
+
+# =====================================================================
+# CONTACT / ADDRESS BOOK TOOLS
+# =====================================================================
+
+
+def _get_contacts_folder(store):
+    """Return the default Contacts folder for a store."""
+    return store.GetDefaultFolder(OL_FOLDER_CONTACTS)
+
+
+def _iter_contact_items(items, limit: int):
+    """Yield up to limit ContactItem objects from an Items collection."""
+    count = 0
+    total = items.Count
+    for i in range(1, total + 1):
+        if count >= limit:
+            break
+        try:
+            item = items.Item(i)
+            if item.Class == _OL_CLASS_CONTACT:
+                yield item
+                count += 1
+        except Exception:
+            continue
+
+
+@mcp.tool()
+async def list_contacts(count: int = 50, account: str = "") -> str:
+    """List contacts from the Outlook address book (Contacts folder).
+
+    Returns contacts sorted by full name. Results are cached in memory for
+    7 days; restart the MCP server to force a refresh.
+
+    Args:
+        count: Maximum contacts to return (1-200). Default 50.
+        account: Optional. Account display name (or substring). Use list_accounts
+            to see available accounts.
+
+    Returns:
+        JSON array of contact summaries.
+    """
+    cache_key = contact_cache.make_key("list_contacts", count=count, account=account)
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _list(outlook, namespace, count, account):
+        count = min(max(1, count), 200)
+        store = _require_store(namespace, account)
+        folder = _get_contacts_folder(store)
+        items = folder.Items
+        items.Sort("[FullName]", True)
+        results = []
+        for item in _iter_contact_items(items, count):
+            results.append(format_contact_summary(item))
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        result = await bridge.call(_list, count, account)
+        if not result.startswith("Error"):
+            contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error listing contacts: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def search_contacts(
+    query: str,
+    count: int = 20,
+    account: str = "",
+) -> str:
+    """Search the Outlook address book by name or email.
+
+    Matches full name and primary/secondary email fields. Results are cached
+    in memory for 7 days per unique query; restart the MCP server to refresh.
+
+    Args:
+        query: Search term (case-insensitive substring).
+        count: Maximum results (1-200). Default 20.
+        account: Optional. Account display name (or substring).
+
+    Returns:
+        JSON array of matching contact summaries.
+    """
+    cache_key = contact_cache.make_key(
+        "search_contacts", query=query, count=count, account=account
+    )
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _search(outlook, namespace, query, count, account):
+        count = min(max(1, count), 200)
+        store = _require_store(namespace, account)
+        folder = _get_contacts_folder(store)
+        safe = _safe_dasl(query)
+        filter_str = (
+            f"([FullName] LIKE '%{safe}%') OR "
+            f"([Email1Address] LIKE '%{safe}%') OR "
+            f"([Email2Address] LIKE '%{safe}%') OR "
+            f"([Email3Address] LIKE '%{safe}%')"
+        )
+        items = folder.Items.Restrict(filter_str)
+        items.Sort("[FullName]", True)
+        results = []
+        for item in _iter_contact_items(items, count):
+            results.append(format_contact_summary(item))
+        return json.dumps(results, indent=2, default=str)
+
+    try:
+        result = await bridge.call(_search, query, count, account)
+        if not result.startswith("Error"):
+            contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error searching contacts: {format_com_error(e)}"
+
+
+@mcp.tool()
+async def resolve_recipient(name: str, account: str = "") -> str:
+    """Resolve a display name or alias to an email address.
+
+    Uses Outlook's address resolution (including Global Address List when
+    available). Results are cached in memory for 7 days.
+
+    Args:
+        name: Display name, alias, or partial email to resolve.
+            Examples: "Jane Doe", "jdoe", "jane@contoso.com".
+        account: Optional. Account context (reserved for multi-store profiles).
+
+    Returns:
+        JSON object with resolved, name, email, and address_type fields.
+    """
+    cache_key = contact_cache.make_key("resolve_recipient", name=name, account=account)
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _resolve(outlook, namespace, name, account):
+        _ = _require_store(namespace, account)  # validate account if provided
+        recipient = outlook.CreateRecipient(name)
+        resolved = recipient.Resolve()
+        if not resolved:
+            return json.dumps({
+                "resolved": False,
+                "name": name,
+                "email": "",
+                "address_type": "",
+                "message": "Could not resolve recipient",
+            }, indent=2)
+        entry = recipient.AddressEntry
+        return json.dumps({
+            "resolved": True,
+            "name": entry.Name or name,
+            "email": entry.Address or "",
+            "address_type": getattr(entry, "Type", "") or "",
+        }, indent=2, default=str)
+
+    try:
+        result = await bridge.call(_resolve, name, account)
+        if not result.startswith("Error"):
+            contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error resolving recipient: {format_com_error(e)}"
 
 
 # =====================================================================

@@ -16,6 +16,7 @@ import re
 from mcp.server.fastmcp import FastMCP
 
 from outlook_desktop_mcp.applescript_bridge import AppleScriptBridge
+from outlook_desktop_mcp.utils.contact_cache import ContactCache
 from outlook_desktop_mcp.utils.applescript_helpers import (
     escape,
     format_date,
@@ -57,11 +58,109 @@ mcp = FastMCP(
         "search events\n"
         "- Tasks: create, list, complete, delete to-do items\n"
         "- Attachments: list and save attachments\n"
-        "- Folders: list folder hierarchy"
+        "- Folders: list folder hierarchy\n"
+        "- Contacts: search and list address book (cached 7 days; limited AppleScript support)"
     ),
 )
 
 bridge = AppleScriptBridge()
+contact_cache = ContactCache()
+
+_MAC_CONTACTS_PROBE: bool | None = None
+
+
+async def _mac_contacts_supported() -> bool:
+    """Probe once whether Outlook exposes contacts via AppleScript."""
+    global _MAC_CONTACTS_PROBE
+    if _MAC_CONTACTS_PROBE is not None:
+        return _MAC_CONTACTS_PROBE
+    script = '''try
+    tell application "Microsoft Outlook"
+        set _ to count of contacts
+    end tell
+    return "ok"
+on error
+    return "no"
+end try'''
+    try:
+        raw = await bridge.run(script)
+        _MAC_CONTACTS_PROBE = raw.strip() == "ok"
+    except Exception:
+        _MAC_CONTACTS_PROBE = False
+    if not _MAC_CONTACTS_PROBE:
+        logger.warning(
+            "Outlook for Mac does not expose contacts via AppleScript; "
+            "contact tools will return an error."
+        )
+    return _MAC_CONTACTS_PROBE
+
+
+def _parse_mac_contact_records(raw: str, query: str = "", limit: int = 50) -> list[dict]:
+    """Parse DELIM/RECORD_DELIM contact lines from AppleScript."""
+    query_lower = query.lower().strip()
+    results = []
+    for record in raw.split(RECORD_DELIM):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split(DELIM)
+        if len(parts) < 3:
+            continue
+        entry_id, full_name, email = (
+            parts[0].strip(),
+            _clean(parts[1]) or "(no name)",
+            _clean(parts[2]),
+        )
+        if query_lower:
+            haystack = f"{full_name} {email}".lower()
+            if query_lower not in haystack:
+                continue
+        results.append({
+            "entry_id": entry_id,
+            "full_name": full_name,
+            "email": email,
+            "company": _clean(parts[3]) if len(parts) > 3 else "",
+            "phone": _clean(parts[4]) if len(parts) > 4 else "",
+            "job_title": _clean(parts[5]) if len(parts) > 5 else "",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _mac_fetch_contacts_script(max_scan: int) -> str:
+    """AppleScript: enumerate contacts up to max_scan for parsing."""
+    return f'''tell application "Microsoft Outlook"
+    set out to ""
+    set n to 0
+    repeat with c in contacts
+        set n to n + 1
+        if n > {max_scan} then exit repeat
+        set cid to id of c as text
+        set cname to ""
+        try
+            set cname to name of c
+        end try
+        set cemail to ""
+        try
+            set cemail to email address of c
+        end try
+        set ccompany to ""
+        try
+            set ccompany to company of c
+        end try
+        set cphone to ""
+        try
+            set cphone to phone of c
+        end try
+        set ctitle to ""
+        try
+            set ctitle to job title of c
+        end try
+        set out to out & cid & "{DELIM}" & cname & "{DELIM}" & cemail & "{DELIM}" & ccompany & "{DELIM}" & cphone & "{DELIM}" & ctitle & "{RECORD_DELIM}"
+    end repeat
+    return out
+end tell'''
 
 
 # --- Helper: truncate long text ---
@@ -1609,6 +1708,139 @@ end tell'''
         return json.dumps(result, indent=2, default=str)
     except Exception as e:
         return f"Error saving attachment: {e}"
+
+
+# =====================================================================
+# CONTACT / ADDRESS BOOK TOOLS (macOS)
+# =====================================================================
+
+_MAC_CONTACTS_UNAVAILABLE = (
+    "Error: Contact tools are not available — Outlook for Mac does not expose "
+    "contacts via AppleScript in this environment."
+)
+
+
+@mcp.tool()
+async def list_contacts(count: int = 50, account: str = "") -> str:
+    """List contacts from Outlook for Mac (when supported by AppleScript).
+
+    Results are cached in memory for 7 days. The account parameter is ignored
+    on macOS (single Outlook profile).
+
+    Args:
+        count: Maximum contacts to return (1-200). Default 50.
+        account: Ignored on macOS.
+
+    Returns:
+        JSON array of contact summaries.
+    """
+    count = min(max(1, count), 200)
+    cache_key = contact_cache.make_key(
+        "mac:list_contacts", count=count, account=account
+    )
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not await _mac_contacts_supported():
+        return _MAC_CONTACTS_UNAVAILABLE
+
+    try:
+        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=500))
+        results = _parse_mac_contact_records(raw, limit=count)
+        result = json.dumps(results, indent=2, default=str)
+        contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error listing contacts: {e}"
+
+
+@mcp.tool()
+async def search_contacts(
+    query: str,
+    count: int = 20,
+    account: str = "",
+) -> str:
+    """Search Outlook contacts by name or email (macOS AppleScript).
+
+    Results are cached in memory for 7 days per query.
+
+    Args:
+        query: Search term (case-insensitive substring).
+        count: Maximum results (1-200). Default 20.
+        account: Ignored on macOS.
+
+    Returns:
+        JSON array of matching contact summaries.
+    """
+    count = min(max(1, count), 200)
+    cache_key = contact_cache.make_key(
+        "mac:search_contacts", query=query, count=count, account=account
+    )
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not await _mac_contacts_supported():
+        return _MAC_CONTACTS_UNAVAILABLE
+
+    try:
+        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=1000))
+        results = _parse_mac_contact_records(raw, query=query, limit=count)
+        result = json.dumps(results, indent=2, default=str)
+        contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error searching contacts: {e}"
+
+
+@mcp.tool()
+async def resolve_recipient(name: str, account: str = "") -> str:
+    """Resolve a name to an email using the local Outlook contact list (macOS).
+
+    Searches cached-eligible contact data from AppleScript. For Global Address
+    List resolution, use Windows COM or resolve manually.
+
+    Args:
+        name: Display name or email fragment to match.
+        account: Ignored on macOS.
+
+    Returns:
+        JSON object with resolved, name, and email fields.
+    """
+    cache_key = contact_cache.make_key(
+        "mac:resolve_recipient", name=name, account=account
+    )
+    cached = contact_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not await _mac_contacts_supported():
+        return _MAC_CONTACTS_UNAVAILABLE
+
+    try:
+        raw = await bridge.run(_mac_fetch_contacts_script(max_scan=1000))
+        matches = _parse_mac_contact_records(raw, query=name, limit=5)
+        if not matches:
+            result = json.dumps({
+                "resolved": False,
+                "name": name,
+                "email": "",
+                "address_type": "mac_contact",
+                "message": "Could not resolve recipient in local contacts",
+            }, indent=2)
+        else:
+            best = matches[0]
+            result = json.dumps({
+                "resolved": True,
+                "name": best["full_name"],
+                "email": best["email"],
+                "address_type": "mac_contact",
+            }, indent=2)
+        contact_cache.set(cache_key, result)
+        return result
+    except Exception as e:
+        return f"Error resolving recipient: {e}"
 
 
 # =====================================================================
