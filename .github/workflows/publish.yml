@@ -16,7 +16,9 @@ jobs:
   publish:
     needs: [unit, security]
     runs-on: ubuntu-latest
-    environment: main
+    # No GitHub Environment — OIDC `sub` is repo:OWNER/REPO:ref:refs/heads/main.
+    # Configure PyPI Trusted Publisher without an environment name (see
+    # docs/pypi-trusted-publishing.md). Older revisions used environment: main.
     permissions:
       id-token: write
       contents: read
@@ -56,3 +58,7 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Optional: set repository secret PYPI_API_TOKEN if Trusted Publishing
+          # is not configured yet (see docs/pypi-trusted-publishing.md).
+          password: ${{ secrets.PYPI_API_TOKEN }}

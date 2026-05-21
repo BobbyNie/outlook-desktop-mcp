@@ -89,6 +89,10 @@ python -m bandit -r src/outlook_desktop_mcp -ll -c pyproject.toml
 `publish.yml` will not push to PyPI unless unit tests and security checks pass
 **and** `pyproject.toml`'s version is greater than the current PyPI release.
 
+If publish fails with **`invalid-publisher`**, configure PyPI Trusted Publishing
+(or add a `PYPI_API_TOKEN` secret) — see
+[docs/pypi-trusted-publishing.md](docs/pypi-trusted-publishing.md).
+
 ### Integration tests (require real Outlook)
 
 With Classic Outlook running on Windows:
